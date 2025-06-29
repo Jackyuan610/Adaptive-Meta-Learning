@@ -1,0 +1,1934 @@
+\documentclass[conference]{IEEEtran}
+
+% === Required Packages ===
+
+% 常用包
+\usepackage{hyperref}
+\usepackage{amsmath, amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc,shapes.geometric, backgrounds, shadows}
+
+% 子图和表格
+\usepackage{caption}    % 子标题功能
+\usepackage{subcaption} % 子图处理
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage[labelfont=bf, labelsep=colon]{caption}
+\captionsetup{compatibility=false}
+
+% 其他功能
+\usepackage{pifont}     % 处理符号
+\definecolor{IEEEblue}{RGB}{0,114,206}
+\definecolor{IEEEred}{RGB}{200,50,50}
+
+
+\title{Adaptive Few-Shot Meta-Learning with Drift Detection and Task-Aware Optimization}
+
+\author{
+    \IEEEauthorblockN{Yiming Yuan}
+    \IEEEauthorblockA{Artificial Intelligence\\
+    The University of Auckland\\
+    \href{mailto:yyua459@aucklanduni.ac.nz}{yyua459@aucklanduni.ac.nz}}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Continual few-shot learning (CFSL) seeks to rapidly adapt to novel tasks with scarce supervision while preserving performance on previously encountered tasks. This paradigm poses two central challenges: (1) distributional drift across tasks, which compromises the generality of static meta-learners, and (2) the plasticity–stability dilemma, where adaptation induces catastrophic forgetting.
+
+We propose a closed-loop, drift-aware meta-learning framework that dynamically adjusts its learning strategy in response to evolving task dynamics. Our approach integrates four core components: a Transformer-based task embedding module; a hybrid drift detector combining statistical divergence metrics with a learned discriminator; an adaptive controller that routes between a ProtoNet path and a MetaSGD+EWC path; and a gated hypernetwork that modulates learning rates and regularization strength in a task-specific manner. A replay buffer is employed to reinforce long-term retention.
+
+Experiments on Mini-ImageNet, Omniglot, and Meta-Dataset under continual task streams with synthetic distribution shifts show that our method consistently surpasses state-of-the-art baselines, including ProtoNet, MAML, and iCaRL. These results highlight the robustness and extensibility of our framework for real-world CFSL scenarios.
+\end{abstract}
+
+
+
+\vspace{0.5em}
+\noindent\textbf{Keywords:} continual few-shot learning, adaptive meta-learning, distributional drift, drift detection, task embedding, MetaSGD, EWC, replay memory, adaptive controller
+
+
+
+\section{Introduction}
+
+Human intelligence demonstrates a unique capacity to learn quickly from limited data while continually adapting to novel environments without catastrophic forgetting. This lifelong learning ability is fundamental in real-world settings—such as robotic control in dynamic environments, or medical diagnostics under evolving disease profiles—where distributional shifts, concept emergence, and non-stationary task streams are the norm. Mimicking such capabilities in artificial systems remains an open challenge in machine learning.
+
+In recent years, \textit{meta-learning}—or “learning to learn”—has emerged as a powerful approach for enabling rapid generalization across tasks, particularly in few-shot learning (FSL) scenarios~\cite{finn2017maml,snell2017prototypical}. These methods, however, often operate under an idealized assumption: that tasks are sampled i.i.d. from a static, well-defined distribution~\cite{zhu2025continual,li2025ckpd}. In contrast, real-world task sequences are inherently non-stationary. In personalized medicine, patients' profiles evolve due to treatment responses or demographic shifts; in robotics, task conditions shift due to environmental changes or human intervention. As such, a model trained under fixed assumptions may fail to adapt or generalize over time.
+
+This motivates the problem of \textit{Continual Few-Shot Learning} (CFSL): how can a system quickly learn new tasks from sparse data while retaining knowledge of past tasks—despite dynamic, evolving task distributions? CFSL lies at the intersection of meta-learning and continual learning, inheriting the sample efficiency of the former and the temporal robustness demanded by the latter. However, it also exposes unique challenges that are often under-addressed in isolation.
+
+\vspace{0.5em}
+\noindent\textbf{What is the problem?}
+\begin{itemize}
+    \item \textbf{Dynamic Task Drift:} Over time, task distributions can shift gradually or abruptly due to domain evolution, label redefinition, or semantic emergence. This renders static task priors ineffective and leads to sharp performance degradation~\cite{zhu2025continual}.
+    \item \textbf{Catastrophic Forgetting:} Fast adaptation to new tasks may overwrite representations learned from earlier tasks, especially when data per task is limited.
+    \item \textbf{Lack of Feedback Awareness:} Most meta-learners apply fixed adaptation strategies, without feedback loops to assess whether a task is novel or familiar, or whether prior knowledge suffices for adaptation.
+\end{itemize}
+
+\vspace{0.5em}
+\noindent\textbf{Why is it important?}  
+Addressing Continual Few-Shot Learning (CFSL) is essential for developing safe, adaptive, and robust learning systems. As illustrated in Figure 1, in healthcare, diagnostic systems must manage evolving disease distributions—such as the progression from conditions like Atelectasis to Pneumonia or Cardiomegaly—without the need for retraining from scratch. As diseases advance, the characteristics of medical images also change, necessitating that the model adapts to these new patterns of disease manifestation. Similarly, in autonomous systems, robots must be able to adapt to new terrains or commands while preserving core control knowledge. The ability to detect emerging tasks, modulate learning behaviors, and retain useful prior knowledge is %not just a desirable feature—it is 
+a critical requirement.
+
+\begin{figure*}[t]  % 使用 figure* 环境使图像跨越双栏
+  \centering
+  \includegraphics[width=\textwidth]{figures/chest.png}  % 设置图像宽度为整页宽度
+  \caption{Eight visual examples of common thorax diseases: Atelectasis, Cardiomegaly, Effusion, Infiltration, Mass, Nodule, Pneumonia, Pneumothorax. These images illustrate the challenge of task drift in medical imaging, where changes in disease types and progression require models to adapt to shifting data distributions \cite{chestxdet10}.}
+  \label{fig:thorax_diseases}
+\end{figure*}
+\noindent
+
+
+\vspace{0.5em}
+\noindent\textbf{How should it be addressed?}  
+We argue that effective CFSL requires a closed-loop system that interprets task inputs, detects distributional drift, adapts learning pathways, and regularizes updates in response to both novelty and historical context. This involves four core capabilities:
+
+\begin{enumerate}
+    \item \textbf{Representation:} Extract semantically meaningful embeddings of tasks, encoding both global patterns and class-level variations.
+    \item \textbf{Perception:} Detect task drift by comparing current task features with historical distributions.
+    \item \textbf{Control:} Decide which learning path to follow—e.g., fast adaptation or cautious regularization—based on contextual signals.
+    \item \textbf{Retention:} Preserve knowledge of past tasks via memory-aware optimization and experience replay~\cite{li2025ckpd}.
+\end{enumerate}
+
+\vspace{0.5em}
+\noindent\textbf{Our solution.}  
+We propose a modular, closed-loop meta-learning framework for CFSL that integrates four tightly coupled modules:
+
+\begin{itemize}
+    \item A \textit{task representation module} based on Transformer encoders, which captures high-level task semantics including support set structure and temporal context;
+    \item A \textit{drift-aware perception module} that combines statistical divergence and neural discrimination to detect task shifts, even under limited samples;
+    \item An \textit{adaptive controller} that selects learning strategies and tunes hyperparameters (e.g., learning rate and regularization strength) dynamically based on task state;
+    \item A \textit{memory-augmented optimizer} that selectively replays past tasks and applies EWC-style regularization to balance adaptation and stability.
+\end{itemize}
+
+This system treats learning as a feedback-driven process. It does not rely on static adaptation policies but instead continuously evaluates and reconfigures its behavior, promoting both responsiveness to novelty and preservation of past knowledge.
+
+\vspace{0.5em}
+\noindent\textbf{Empirical validation.}  
+We evaluate our framework on a suite of benchmarks—including Mini-ImageNet, Omniglot, and Meta-Dataset—under synthetic and natural task drift. Results show that our system consistently outperforms baselines in both plasticity (fast adaptation) and stability (knowledge retention), achieving lower forgetting rates and higher overall accuracy. Ablation studies further confirm the importance of each module and validate the controller’s decision-making under drift.
+
+\vspace{0.5em}
+\noindent\textbf{Contributions.}
+\begin{itemize}
+    \item We introduce a novel, modular framework for continual few-shot learning, built on the principles of feedback-driven adaptation and drift awareness.
+    \item We propose interpretable mechanisms for task representation, drift perception, and per-task control, enabling scalable and generalizable learning across non-stationary domains.
+    \item We demonstrate state-of-the-art performance across diverse datasets, and provide insights into the internal behavior of the system through detailed visualization and analysis.
+\end{itemize}
+
+
+
+
+
+\section{Related Work}
+
+\subsection{Meta-Learning and Few-Shot Learning}
+
+Meta-learning, or ``learning to learn,'' trains models over a distribution of tasks to enable rapid adaptation to novel tasks with limited supervision~\cite{schmidhuber1987}. This paradigm is particularly well-suited for few-shot learning (FSL), where only a handful of labeled samples are available per class, yet strong generalization is required. In contrast to traditional deep learning methods—which rely on large datasets and extensive task-specific fine-tuning—meta-learning frameworks aim to extract transferable inductive biases across tasks to support efficient learning in low-data regimes.
+
+One of the most influential approaches in this area is Model-Agnostic Meta-Learning (MAML)~\cite{finn2017}, which learns an initialization of model parameters that can be rapidly adapted to unseen tasks via a few steps of gradient descent. Its task-agnostic nature and compatibility with any differentiable model architecture have made it a widely adopted baseline. However, MAML suffers from several limitations: (1) it involves computing second-order derivatives, which introduces significant computational overhead; (2) it is sensitive to the choice of inner-loop learning rate; and (3) it often struggles with stability during optimization, particularly in high-variance task distributions.
+
+To mitigate these issues, simplified variants such as First-Order MAML (FOMAML) and Reptile~\cite{nichol2018} approximate the meta-gradient, reducing computational complexity while maintaining competitive performance. While these methods improve scalability, they often sacrifice adaptation quality in complex task environments.
+
+Another dominant family of methods is metric-based meta-learning. Prototypical Networks (ProtoNet)~\cite{snell2017} represent each class by the centroid of its support embeddings and classify queries based on their distances to these prototypes in a learned embedding space. This approach avoids inner-loop optimization altogether, yielding high efficiency and low variance. Subsequent works have extended metric-based learning with relational reasoning~\cite{sung2018relationnet}, attention mechanisms~\cite{oreshkin2018tadam}, and adaptive metrics~\cite{zhang2020deepemd} to further enhance performance.
+
+Despite these advancements, a common assumption across most meta-learning methods is that the task distribution remains stationary—i.e., all tasks are sampled i.i.d. from a fixed meta-distribution. In practice, however, this assumption is often violated. When task distributions drift over time—due to domain shifts, class novelty, or changes in semantic structure—the priors learned during meta-training may become misaligned with new task conditions, degrading performance. Existing methods lack mechanisms to detect or adapt to such shifts, limiting their robustness in real-world deployments.
+
+Moreover, most meta-learning algorithms are not inherently equipped to handle continual task arrival, where new tasks appear sequentially and previously encountered tasks may no longer be revisited. In this setting, models face the challenge of maintaining performance on earlier tasks while adapting to new ones—a phenomenon known as catastrophic forgetting~\cite{mccloskey1989catastrophic}. Conventional FSL approaches typically discard old task information after adaptation, lacking the memory or architectural flexibility required for long-term retention.
+
+To address these shortcomings, recent efforts have begun exploring the intersection of meta-learning and continual learning~\cite{rajasegaran2020itaml, jerfel2019reconciling}. Some approaches extend MAML with memory replay~\cite{javed2019meta}, while others incorporate regularization or dynamic networks~\cite{fini2022self}. Nevertheless, many of these methods treat drift and task arrival implicitly, without explicit mechanisms for detecting distributional change or selecting suitable adaptation strategies.
+
+Our work builds upon this foundation by proposing a meta-learning framework that is explicitly designed to operate under evolving task distributions. We augment the meta-learning loop with drift detection, task-conditioned control, and dynamic optimization routing. This enables our model not only to adapt rapidly to new tasks but also to maintain prior knowledge and remain robust under continual, non-stationary conditions.
+
+
+\subsection{Continual Meta-Learning}
+
+Continual meta-learning addresses the challenge of learning from a non-stationary stream of tasks, where the task distribution may evolve over time and previous data may no longer be accessible~\cite{parisi2019continual}. Unlike conventional meta-learning—which assumes i.i.d. sampling from a fixed task distribution—continual meta-learning frameworks must strike a balance between fast adaptation to new tasks and retention of knowledge from earlier ones. This setting exacerbates two fundamental issues: \emph{catastrophic forgetting}, where new learning overwrites old knowledge~\cite{mccloskey1989catastrophic}, and \emph{task interference}, where conflicting gradients from different tasks hinder convergence.
+
+To mitigate forgetting, several regularization-based methods have been proposed. A widely adopted approach is Elastic Weight Consolidation (EWC)~\cite{kirkpatrick2017overcoming}, which estimates the importance of each parameter via the Fisher Information Matrix and constrains updates to critical weights. While effective in conventional continual learning, EWC does not leverage meta-learning’s inter-task dynamics and lacks responsiveness to evolving task semantics. Similar regularization schemes include Synaptic Intelligence~\cite{zenke2017continual} and Memory Aware Synapses (MAS)~\cite{aljundi2018memory}, which likewise lack adaptation flexibility in task-variant settings.
+
+Experience replay is another prominent strategy. Meta-Experience Replay (MER)~\cite{riemer2019learning} extends gradient-based meta-learners like Reptile and MAML by incorporating a memory buffer of past tasks into the meta-update loop. MER enables implicit rehearsal and gradient alignment across tasks. Related approaches such as Averaged Gradient Episodic Memory (A-GEM)~\cite{chaudhry2018efficient} and ER-MAML~\cite{pham2021contextual} similarly utilize task replay to enhance stability. However, these methods typically assume access to well-defined task boundaries and uniform sampling, which may not hold under real-world drift.
+
+Modular architectures and parameter isolation offer another design philosophy. Progressive Networks~\cite{rusu2016progressive} instantiate a new subnetwork for each task, preserving earlier parameters via lateral connections. Learning without Forgetting (LwF)~\cite{li2017learning} uses distillation from prior task outputs to regularize new learning. These methods reduce forgetting but suffer from poor scalability, rigid task assignment, and inefficient parameter growth—making them unsuitable for long-horizon continual meta-learning.
+
+A more flexible line of research explores task-specific modulation and gating. For instance, contextual meta-learners~\cite{von2019continual, yoon2020xtarnet} employ learned task embeddings or attention-based routers to condition parameter updates on task identity. Although such approaches improve plasticity–stability trade-offs, they typically require task identity labels or strong priors, and struggle in the presence of gradual or latent distributional drift.
+
+A key limitation across these methods is the lack of proactive task-shift detection and dynamic response mechanisms. Most models treat tasks as discrete and assume a known structure or sequence, making them ill-suited for environments with ambiguous, gradual, or compound drift. Moreover, they rely on hand-tuned or static hyperparameters—such as fixed learning rates or regularization weights—which restrict adaptability in varying task landscapes.
+
+In contrast, our method introduces a hybrid drift detection module that monitors both statistical and learned signals of distributional change, including KL divergence, mean embedding shifts, and discriminator confidence. When drift is detected, an adaptive controller adjusts learning rate $\eta$ and regularization strength $\lambda$ through a gated hypernetwork, choosing between a memory-based MetaSGD+EWC path and a fast ProtoNet route. Combined with a compact replay memory and Transformer-based task embeddings, our model continuously adapts to novel tasks while maintaining stability, without requiring explicit drift labels or task boundaries. This enables robust and autonomous continual meta-learning under real-world, non-stationary conditions.
+
+
+\subsection{Concept Drift Detection}
+
+Concept drift refers to the phenomenon where the statistical properties of input data or the relationship between inputs and labels change over time, causing degradation in model performance~\cite{gama2014survey}. Drift arises naturally in dynamic environments such as data streams, real-time sensor systems, personalized services, and online decision-making pipelines. It is particularly critical in continual and meta-learning contexts, where tasks arrive sequentially, and assumptions of stationarity are routinely violated.
+
+Drift can be categorized by temporal pattern—\emph{abrupt} (sudden change), \emph{gradual} (slow evolution), \emph{incremental} (stepwise shift), or \emph{recurring} (re-emergent patterns)—and by cause: changes in input distribution (covariate drift), label distribution (prior drift), or decision boundary (concept drift in the strict sense)~\cite{widmer1996learning}. Detecting and responding to such changes is essential for long-term model robustness and data-aligned adaptation.
+
+Traditional drift detection techniques fall into two main classes: statistical methods and model-based detectors. Statistical approaches operate on summary statistics and measure distributional changes over time windows. Popular metrics include Kullback–Leibler (KL) divergence~\cite{klein2003hmm}, Jensen–Shannon divergence, the Population Stability Index (PSI), and two-sample hypothesis tests such as the Kolmogorov–Smirnov test. Windowed drift detection techniques such as DDM~\cite{gama2004learning}, EDDM~\cite{baena2006early}, and ADWIN~\cite{bifet2007learning} track performance or confidence scores over time and trigger alarms when change is statistically significant. While interpretable and efficient, these methods are often sensitive to hyperparameters, poorly scalable to high-dimensional inputs, and limited in distinguishing task-relevant change from noise.
+
+Model-based techniques rely on learned signals that capture evolving task characteristics. Examples include training auxiliary discriminators to distinguish between old and new distributions~\cite{lu2018learning}, modeling residual errors over time~\cite{webb2016characterizing}, and fitting uncertainty-aware classifiers. These approaches can capture fine-grained drift and adapt to semantic changes but are often data-hungry and computationally expensive. In few-shot and meta-learning settings, where each task provides limited labeled data and the time horizon is short, the overhead of training complex detectors is prohibitive.
+
+To address these challenges, recent research has proposed hybrid drift detectors that combine statistical indicators with lightweight learned components. For instance, neural approaches often use shallow multilayer perceptrons (MLPs) operating on latent features or embeddings to detect semantic shifts~\cite{lu2018learning, elwell2011incremental}. In task-based meta-learning, drift is not always evident in raw input statistics; instead, shifts may manifest subtly in prototype representations, embedding distributions, or task-specific behaviors. Capturing these cues requires detectors that are not only sensitive to distributional change but also aligned with the task structure.
+
+Despite their relevance, few existing meta-learning frameworks integrate drift detection directly into their adaptation loop. Most either assume task transitions are externally labeled or infer change post hoc via performance drop—introducing delays and instability. Furthermore, adaptation strategies are rarely conditional on the type or magnitude of detected drift, limiting their responsiveness in dynamic environments.
+
+Our work addresses these limitations by designing a hybrid drift detection module that integrates three complementary signals: (1) KL divergence between task embeddings, which captures coarse distributional shift; (2) mean vector shift of task embedding centroids, which tracks latent task evolution; and (3) binary classification confidence from an MLP discriminator trained to distinguish between pre- and post-drift embeddings. This combination captures both low-level statistical and high-level semantic drift while remaining computationally lightweight.
+
+Upon drift detection, our controller dynamically adjusts the meta-learner’s behavior by activating replay memory, tuning hyperparameters (learning rate $\eta$ and regularization $\lambda$), and routing to an appropriate optimization pathway. Unlike prior methods, our drift-aware mechanism is integrated into a closed-loop continual meta-learning process, enabling proactive, context-sensitive response to task distribution shifts without external supervision or expensive calibration.
+
+
+\subsection{Task Embedding and Task-Aware Optimization}
+
+In meta-learning, task embedding aims to represent each task as a compact, fixed-length vector that encodes its unique characteristics—such as input distribution, label semantics, class diversity, and complexity~\cite{rusu2019meta}. These embeddings enable task-conditioned learning by allowing the meta-learner to modulate optimization behavior based on task identity and structure. This is particularly beneficial in few-shot and continual learning settings, where task heterogeneity can significantly affect generalization and model stability.
+
+Several methods have been proposed to compute task embeddings, ranging from implicit attention-based encodings to explicit learned representations. Matching Networks~\cite{vinyals2016matching} use attention mechanisms over support examples to implicitly capture task context. More explicit embedding strategies appear in LEO (Latent Embedding Optimization)~\cite{rusu2019leo}, which learns a latent space of tasks via an encoder and performs inner-loop optimization within that space instead of the model’s parameter space. By disentangling task representation and model adaptation, LEO improves generalization in low-data regimes.
+
+TADAM~\cite{oreshkin2018tadam} introduces task-dependent feature modulation via Feature-wise Linear Modulation (FiLM) layers~\cite{perez2018film}, which apply affine transformations conditioned on task embeddings to intermediate feature maps. This mechanism allows task identity to directly influence representation learning. Similar approaches have been adopted in MetaNet~\cite{munkhdalai2017meta}, which predicts fast weights based on task context, and in TaskNorm~\cite{bronskill2020tasknorm}, which normalizes features adaptively for each task. These methods underscore the value of task-level signals in improving both feature extraction and adaptation dynamics.
+
+In continual learning, task-aware optimization often involves architectural conditioning through gating, masking, or weight generation. HyperNetworks~\cite{von2019continual, ha2016hypernetworks} dynamically produce network weights conditioned on task embeddings, enabling flexible parameter reuse and reducing forgetting. Modular approaches such as contextual parameter generation~\cite{alet2018modular} employ routing networks or mixture-of-experts structures to assign task-specific computation paths. While effective under clearly defined task boundaries, these methods struggle in non-stationary or unlabeled scenarios where tasks shift gradually or overlap semantically.
+
+A key limitation in many task embedding methods lies in their reliance on abundant support data or static task distributions. In few-shot or streaming settings, where support sets are small and tasks evolve continuously, embedding accuracy suffers. Additionally, embeddings are often used passively—for task routing or gating—without deeper integration into the optimization process itself. Very few approaches leverage embeddings to directly modulate hyperparameters such as learning rates or regularization strengths in a dynamic and data-driven manner.
+
+To address these limitations, we propose a hybrid task embedding that captures both structural and temporal characteristics of tasks. Specifically, we construct an embedding vector composed of: (1) the mean $\mu$ and (2) standard deviation $\sigma$ of feature activations from the support set; (3) class-wise prototype distributions $\{p_c\}$ that summarize inter-class structure; and (4) a contextual history vector $h_{\text{ctx}}$ derived from prior adaptation trajectories. This design encodes not only the current task’s statistical structure but also its temporal position in the task stream.
+
+Our model incorporates this embedding into an adaptive controller that dynamically adjusts meta-optimization parameters. The controller consumes the embedding to determine task-specific learning rate $\eta$ and regularization strength $\lambda$, enabling informed pathway selection between ProtoNet-style inference and MetaSGD+EWC-based adaptation. This tight coupling between representation and optimization forms a closed-loop adaptation system.
+
+Unlike prior work, which treats task embeddings as auxiliary input or side information, our approach promotes embeddings to active control signals. They guide optimization decisions at runtime, allowing the model to self-regulate its adaptation based on task novelty, difficulty, and historical drift. This design enables principled, robust, and flexible meta-learning across a wide range of dynamic few-shot scenarios.
+
+
+\subsection{Adaptive Controllers and Reinforcement-Like Meta-Control}
+
+Adaptive control in meta-learning refers to dynamically adjusting internal learning mechanisms—such as learning rate schedules, loss weighting, or parameter routing—based on the characteristics of individual tasks. This approach aligns with the broader concept of meta-optimization, where a learned controller governs how models are updated, rather than using fixed heuristics. Such mechanisms are particularly valuable in non-stationary environments, where static hyperparameters often lead to brittle adaptation and degraded performance~\cite{andrychowicz2016learning}.
+
+Early meta-control frameworks emerged from the ``learning to learn'' (L2L) paradigm~\cite{hochreiter2001learning}, where recurrent neural networks (RNNs), typically LSTMs, are trained to act as optimizers over task-specific losses. The inner optimizer's parameters are learned in an outer loop, allowing for flexible and data-driven adaptation strategies. While conceptually elegant, L2L-style methods suffer from poor scalability and high sample complexity, limiting their practicality in large-scale settings.
+
+Reinforcement-based meta-controllers offer an alternative, formulating meta-learning as a Markov Decision Process over task sequences. In RL$^2$~\cite{duan2016rl2}, for example, an agent’s policy is optimized across episodes using recurrent networks, effectively learning a learning algorithm. Follow-up work explored various reinforcement learning (RL) objectives, including REINFORCE-style gradient estimation~\cite{bengio1990learning} and Q-learning-based policy modulation~\cite{xu2018meta}. These methods enable flexible, trial-and-error-driven optimization behavior, but are often unstable and require extensive reward shaping and episode design.
+
+In supervised few-shot learning, adaptive control mechanisms have been implemented via gating, attention, or path-routing strategies. SNAIL~\cite{mishra2018simple} uses temporal convolutions and attention to extract meta-sequential information across time steps. Dynamic Routing Networks~\cite{rosenbaum2018routing} extend this idea by allowing the architecture to reconfigure its internal path of computation conditioned on task-specific context. Other methods, such as LITE~\cite{ravi2018amortized} and MetaNet~\cite{munkhdalai2017meta}, use controller networks to generate fast weights or modulate feature extractors, based on latent representations of the task.
+
+Despite their diversity, many existing meta-controllers rely on fixed or globally-shared hyperparameters—such as learning rate $\eta$, regularization strength $\lambda$, or inner-loop step size—across all tasks. This limitation is particularly harmful under task drift or continual learning scenarios, where the optimal learning dynamics vary across time and task. Furthermore, most controllers are treated as black-box optimizers, offering limited interpretability or controllability over the learning process.
+
+Our approach addresses these challenges through a lightweight, differentiable task-aware controller that consumes a task embedding vector and outputs task-specific optimization hyperparameters. In particular, the controller predicts values of $\eta$ and $\lambda$ that govern the inner-loop learning rate and regularization strength, respectively. These outputs modulate the choice between two optimization pathways: a fast ProtoNet-style inference track and a more cautious MetaSGD+EWC path.
+
+Unlike traditional RL-based meta-controllers, our design draws reinforcement-like intuition—adapting to environmental feedback via drift signals and performance history—without requiring explicit reward functions or policy rollouts. This makes our system efficient and directly compatible with standard gradient-based meta-learners. By integrating controller outputs into the meta-optimization loop, we form a closed feedback system that continuously aligns adaptation behavior with current task conditions.
+
+Importantly, our controller provides interpretable and reactive modulation: when task drift is detected or the task embedding signals increased complexity, the controller increases regularization and reduces learning rate; conversely, for familiar or stable tasks, it favors faster, low-penalty updates. This per-task control strategy enhances both plasticity and stability—two competing goals in continual meta-learning.
+
+Our method thus moves beyond hand-tuned heuristics and black-box optimization, toward principled, modular, and task-aware meta-control. It enables informed and flexible learning across diverse, dynamic task environments—without sacrificing computational efficiency or interpretability.
+
+\subsection{Replay Memory and Long-Term Knowledge Retention}
+
+Replay memory mechanisms are widely used in continual learning to combat catastrophic forgetting by reintroducing past experience during training~\cite{rolnick2019experience}. In contrast to regularization-based methods, which constrain parameter updates indirectly, replay-based approaches explicitly re-expose the model to previously seen tasks or samples. This reinforces long-term knowledge retention and improves model robustness in non-stationary environments.
+
+In standard continual learning, experience replay is often implemented via exemplar buffers~\cite{rebuffi2017icarl}, episodic memory modules~\cite{lopez2017gradient}, or dynamic sampling strategies~\cite{riemer2019learning}. Notably, iCaRL~\cite{rebuffi2017icarl} maintains class exemplars for rehearsal, while GEM and A-GEM~\cite{lopez2017gradient, chaudhry2018efficient} constrain gradient updates to avoid interference with stored memories. These methods have shown strong empirical performance, especially in classification settings with discrete task identities.
+
+In meta-learning, integrating replay presents unique challenges. Tasks—not individual samples—are the basic units of learning, and maintaining a diverse, compact, and informative memory of past tasks is nontrivial. Moreover, the inner-loop optimization process may overfit to small support sets, leading to drift in learned representations. Approaches such as MER~\cite{riemer2019learning} incorporate task-level replay during meta-update phases, aligning gradients from current and previous tasks to improve stability.
+
+Some recent meta-learning systems use structured memory modules, such as key-value stores or episodic retrieval~\cite{santoro2016meta, ravi2017episodic}, to preserve high-level task knowledge. However, these systems often require significant architectural overhead or strong task identity priors, which limits scalability and generality.
+
+Our work employs a lightweight but effective task replay mechanism. We maintain a buffer of representative task embeddings and their corresponding optimization traces. During training, past tasks are periodically sampled for conditional replay, especially when drift is detected or performance degrades. This enables our model to reinforce important prior knowledge while continuing to adapt to new distributions.
+
+Unlike full rehearsal of raw samples, which is often impractical in few-shot or privacy-sensitive settings, our memory operates at the task embedding level. This compact representation allows for efficient memory usage and scalable replay across many tasks. Moreover, memory selection is guided by drift detection signals, focusing computation on tasks likely to be forgotten or underrepresented.
+
+By combining memory replay with task-aware optimization and drift-responsive control, our framework achieves long-term retention without sacrificing adaptability. This design aligns with cognitive theories of episodic recall in humans~\cite{marblestone2016towards}, offering a biologically plausible and computationally efficient solution to continual meta-learning.
+
+\vspace{0.5em}
+\noindent\textbf{Summary.} Existing work in meta-learning, continual learning, drift detection, task embedding, adaptive control, and memory replay has made significant progress in addressing specific aspects of dynamic task adaptation. However, most prior approaches treat these components in isolation, lack principled integration mechanisms, or assume strong task supervision and stationarity. In contrast, our method unifies these elements into a cohesive, closed-loop meta-learning system that is explicitly designed for dynamic and evolving task distributions. By embedding drift-aware detection, task-informed control, and memory-guided replay into the core meta-optimization loop, our framework achieves both rapid task adaptation and long-term retention—paving the way for robust continual few-shot learning in realistic environments.
+
+\vspace{0.5em}
+\noindent\textbf{We now describe the components and learning dynamics of our proposed method in detail.}
+
+
+\section{Methodology}
+
+We propose a closed-loop, adaptive meta-learning framework for continual few-shot classification under distributional drift. Unlike conventional meta-learners that assume stationary task distributions and fixed update rules, our system continuously re-assesses and re-configures its learning strategy based on observed task characteristics. This framework is designed to address two major challenges: (1) the emergence of distributional drift, which invalidates assumptions of task similarity, and (2) the plasticity–stability dilemma, where adapting to new tasks often leads to forgetting past knowledge.
+
+Our approach consists of four tightly integrated modules, each tailored to a key subproblem in continual few-shot learning:
+
+\begin{itemize}
+    \item \textbf{Task Embedding Module}: Transforms a support set into a semantic vector representation by combining global feature statistics, class-wise prototypes, and contextual structure. This enables reasoning over task similarity and complexity.
+
+    \item \textbf{Hybrid Drift Detection}: Identifies distributional shift by fusing three sources of evidence — statistical divergence (KL), temporal trends (mean shift), and a learned drift classifier — allowing for robust detection under low-shot constraints.
+
+    \item \textbf{Adaptive Controller}: Receives drift and complexity signals to dynamically choose between inference-based and optimization-based adaptation paths. It generates per-task hyperparameters ($\eta_i$, $\lambda_i$) via a gated hypernetwork.
+
+    \item \textbf{Conditional Optimizer (MetaSGD + EWC)}: Activated only when drift is detected, this component performs rapid inner-loop fine-tuning while constraining forgetting through Fisher-weighted regularization.
+\end{itemize}
+
+These modules form a closed-loop pipeline. Each incoming task is first embedded to produce a task signature $\mathbf{t}_i$, which feeds into a hybrid drift detector. Based on the estimated drift intensity and task complexity, the controller selects a suitable adaptation strategy and hyperparameters. Finally, the optimizer applies conditional updates or performs fast prototype inference. Throughout this process, a replay memory module stores historical statistics for continual calibration.
+
+In the remainder of this section, we detail the structure, function, and interactions of each module.
+
+
+\subsection*{Problem Setting and Task Formalization}
+
+\paragraph{Continual Few-Shot Learning (CFSL).}
+We consider a meta-learning agent deployed in a non-stationary environment, where it is exposed to a sequence of few-shot classification tasks:
+\[
+\{\mathcal{T}_1, \mathcal{T}_2, \dots, \mathcal{T}_T\}, \quad \mathcal{T}_i = (S_i, Q_i) \sim \mathcal{D}_i(x, y)
+\]
+
+Each task consists of:
+\begin{itemize}
+    \item A support set $S_i = \{(x_j^s, y_j^s)\}_{j=1}^{N_s}$: a small set of labeled examples used for inner-loop adaptation.
+    \item A query set $Q_i = \{(x_j^q, y_j^q)\}_{j=1}^{N_q}$: used for evaluating the model's performance post-adaptation.
+\end{itemize}
+
+Unlike classical meta-learning, where tasks are assumed to be i.i.d. from a fixed task distribution $p(\mathcal{T})$~\cite{finn2017maml}, in CFSL, we assume that the task distribution evolves over time due to various factors such as label novelty, domain shift, or semantic drift. This dynamic nature of tasks presents additional challenges for meta-learners, as they must adapt to new tasks while retaining knowledge from previous ones.
+
+\paragraph{Types of Distributional Drift.}
+We define drift as any change between the current task distribution $\mathcal{D}_i$ and historical distributions $\{\mathcal{D}_j\}_{j<i}$, which can occur due to several factors:
+- **Label Shift**: The label space changes between tasks, potentially introducing new classes or redefining existing ones. This shift prevents the reuse of classifiers that were trained on earlier task labels.
+- **Covariate Shift**: The input distribution changes, but the label space remains unchanged. This results in inaccurate prototypes and model misalignment.
+- **Feature Geometry**: Both inputs and labels shift, leading to low margins and instability in generalization across tasks.
+
+These drifts are summarized in Table~\ref{tab:drift_types}, which illustrates how different types of drift affect meta-learners.
+
+\begin{table*}[t]
+\centering
+\caption{Types of task distribution drift and their effect on meta-learners.}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccp{10cm}}  % 更大宽度！
+\toprule
+\textbf{Drift Type} & \textbf{Input $x$ Change?} & \textbf{Label Change?} & \textbf{Impact} \\
+\midrule
+Label Shift & \ding{55} & \ding{51} & No label overlap; classifier reuse fails \\
+Covariate Shift & \ding{51} & \ding{55} & Feature shift; inaccurate prototypes \\
+Feature Geometry & \ding{51} & \ding{51}/\ding{55} & Low margin; unstable generalization \\
+\bottomrule
+\end{tabular}
+\label{tab:drift_types}
+\end{table*}
+
+\paragraph{Drift Quantification.}
+We quantify the drift between two tasks by calculating a divergence measure over task-level distributions. Specifically, we use:
+\[
+\Delta_{i,j} = \mathcal{D}(\mathcal{D}_i \,\|\, \mathcal{D}_j), \quad \mathcal{D}(\cdot) \in \{\mathrm{KL}, \mathrm{Wasserstein}, \mathrm{MMD}\}
+\]
+where $\mathcal{D}$ represents a divergence metric, such as Kullback-Leibler (KL) divergence, Wasserstein distance, or Maximum Mean Discrepancy (MMD). In practice, we approximate $\mathcal{D}_i$ using the embedding statistics of support features, allowing for efficient drift measurement even in high-dimensional or sparse data regimes. The choice of divergence measure depends on the nature of the drift and the task representation.
+
+\paragraph{Learning Objective.}
+At each step, the meta-learner faces the following objectives:
+\begin{enumerate}
+    \item Rapidly adapt to the current task $\mathcal{T}_i$ using only the support set $S_i$.
+    \item Minimize loss on the query set $Q_i$, which is used to evaluate the performance post-adaptation.
+    \item Retain knowledge from previous tasks $\{\mathcal{T}_j\}_{j<i}$ by minimizing forgetting.
+    \item Detect whether the current task distribution $\mathcal{D}_i$ differs significantly from historical distributions.
+\end{enumerate}
+
+The full objective function incorporates adaptation, retention, and drift awareness:
+\[
+\mathcal{L}_{\text{total}} = 
+\underbrace{\mathbb{E}_{\mathcal{T}_i}[\mathcal{L}_{\text{query}}(f_{\theta_i}, Q_i)]}_{\text{Adaptation Accuracy}} 
++ \underbrace{\lambda \cdot \mathcal{R}_{\text{forgetting}}}_{\text{Retention}} 
++ \underbrace{\mu \cdot \mathcal{L}_{\text{drift}}}_{\text{Drift Awareness}}
+\]
+
+Where:
+\begin{itemize}
+    \item $\mathcal{R}_{\text{forgetting}} = \sum_{j < i} \| f_{\theta_i}(Q_j) - f_{\theta_j}(Q_j) \|$ or Fisher-based penalty, which penalizes deviations from previous task predictions to reduce forgetting.
+    \item $\mathcal{L}_{\text{drift}} = \mathrm{BCE}(g_\phi(\mathbf{t}_i), y_{\text{drift}})$ is the binary cross-entropy loss for the drift classifier, where $g_\phi$ is the drift detection model.
+    \item $\lambda$ and $\mu$ control the tradeoff between adaptation accuracy, retention, and drift sensitivity, ensuring a balanced optimization across objectives.
+\end{itemize}
+
+\paragraph{Task Stream and Memory Design.}
+We simulate drift every $k$ tasks by introducing either new label sets or domain style shifts. To support drift detection and replay, we maintain a memory buffer $\mathcal{M}$ that stores:
+\begin{itemize}
+    \item Historical task embeddings $\{\mathbf{t}_j\}$, representing the high-level features of past tasks;
+    \item Fisher matrices $\{F_j\}$, used to quantify parameter importance for each task;
+    \item Snapshot parameters $\{\theta_j^*\}$, representing the optimal model weights for each task.
+\end{itemize}
+
+This memory enables drift estimation, replay regularization, and controller modulation, which are key to mitigating catastrophic forgetting and enabling adaptive control. We employ FIFO or clustering-based memory replacement strategies to ensure that the memory size remains manageable and that the most relevant tasks are retained for replay.
+
+\subsection*{2. System Overview}
+
+\subsubsection*{2.1 Motivation for a Closed-Loop Adaptive Meta-Learner}
+
+In continual few-shot learning (CFSL), a meta-learning agent is exposed to a sequence of tasks $\{\mathcal{T}_1, \mathcal{T}_2, \dots, \mathcal{T}_T\}$, each sampled from an evolving task distribution $\mathcal{D}_t(x, y)$. These tasks may differ in various aspects, including class semantics, domain structures, and visual modalities. In real-world applications such as personalized recommendations, robotics, and autonomous navigation, such distributional drift is commonplace. A task distribution can evolve over time due to factors like emerging classes, environmental changes, or shifting user preferences. As a result, meta-learners must continually adapt to new data while avoiding catastrophic forgetting of previously learned tasks.
+
+Traditional meta-learners, including approaches like MAML~\cite{finn2017maml} and ProtoNet~\cite{snell2017prototypical}, operate on the assumption that all tasks are sampled i.i.d. from a fixed distribution. These models apply a uniform update rule across tasks, often failing to account for task heterogeneity or temporal evolution in task characteristics. Such static approaches struggle in dynamic environments, leading to overfitting on previously learned tasks or underfitting on novel tasks, which harms the generalization ability of the model and leads to poor long-term performance.
+
+To address this gap, we propose a \textit{closed-loop adaptive meta-learning system}, where the model evaluates the semantic and statistical profile of each incoming task and responds with a customized adaptation pathway. Rather than applying fixed updates, the system dynamically adjusts its learning strategy based on task-specific characteristics such as drift in label semantics, domain structure, or task complexity. By continuously sensing incoming task characteristics, detecting drift, and modulating its internal update policies, the system can effectively balance between plasticity (learning new tasks) and stability (preserving learned knowledge).
+
+\subsubsection*{2.2 Architectural Overview and Module Interfaces}
+
+Our closed-loop meta-learning system is structured into four interconnected modules, each of which performs a specialized function to enable dynamic adaptation. These modules work together to process incoming tasks and generate efficient responses:
+
+\begin{itemize}
+    \item \textbf{Task Embedding Module} $\mathcal{E}_\phi$: The task embedding module takes the support set $S_i$ and computes a task-level embedding vector $\mathbf{t}_i = \mathcal{E}_\phi(S_i)$. This vector captures key semantic features of the task, including its class distribution, feature geometry, and complexity. The embedding enables task-specific adaptation and acts as the basis for downstream processing.
+    
+    \item \textbf{Hybrid Drift Detector} $\mathcal{D}_\psi$: The drift detector compares the current task embedding $\mathbf{t}_i$ with prior task embeddings $\{\mathbf{t}_j\}_{j<i}$ stored in memory. This comparison is performed using statistical divergence measures (e.g., KL divergence) and temporal shifts in task feature space. Additionally, a neural classifier $g_\psi$ estimates the likelihood of drift. The output includes a drift score $D_i$ and the classifier’s confidence $p_i$ in the task's distributional shift.
+
+    \item \textbf{Adaptive Controller} $\mathcal{C}_\omega$: Based on the task embedding $\mathbf{t}_i$ and drift score $D_i$, the adaptive controller generates task-specific hyperparameters such as the learning rate $\eta_i$ and regularization strength $\lambda_i$. It also decides whether to route the task through an inference pathway (ProtoNet) or an optimization pathway (MetaSGD+EWC). This dynamic routing ensures efficient adaptation, depending on the drift severity and task complexity.
+
+    \item \textbf{Conditional Optimizer} $\mathcal{O}_\theta$: The optimizer performs task-specific updates based on the routing decision made by the controller. For drifted tasks, the model updates using MetaSGD with EWC regularization to avoid forgetting; for stable tasks, the model uses ProtoNet for fast non-parametric inference, relying on class prototypes $\{\mathbf{p}_c\}$.
+\end{itemize}
+
+\subsubsection*{2.3 Task Stream and Dynamic Routing Logic}
+
+
+\begin{enumerate}
+    \item $\mathbf{t}_t = \mathcal{E}_\phi(S_t)$: The task embedding module generates a vector $\mathbf{t}_t$ from the current support set $S_t$.
+    \item $(D_t, p_t) = \mathcal{D}_\psi(\mathbf{t}_t, \mathcal{M})$: The drift detector compares the current task embedding with those in memory and computes drift score $D_t$ and classifier confidence $p_t$.
+    \item The controller $\mathcal{C}_\omega$ decides:  
+        \[
+        \text{Route}_t = 
+        \begin{cases}
+        \texttt{MetaSGD+EWC} & \text{if } D_t > \delta \text{ or } p_t > \tau \\
+        \texttt{ProtoOnly} & \text{otherwise}
+        \end{cases}
+        \]
+    \item The learner $\mathcal{O}_\theta$ performs updates or inference according to the chosen path.
+\end{enumerate}
+
+This dynamic routing mechanism allows the system to specialize its adaptation depending on the task. For instance, if a task is detected as drifted (e.g., new classes or semantic shifts), the system triggers gradient-based updates to adjust its model. For stable tasks, it switches to non-parametric inference, which is computationally more efficient.
+
+\subsubsection*{2.4 Feedback Mechanism and Memory Integration}
+
+One of the core innovations of our approach is the integration of a replay memory $\mathcal{M}$, which stores important task representations and Fisher matrices. This memory system enables several key functionalities:
+\begin{itemize}
+    \item \textbf{Temporal comparison}: The drift detection module uses memory to compute divergence metrics (e.g., KL divergence) and monitor rolling mean shifts over time.
+    \item \textbf{Regularization anchors}: EWC uses the Fisher matrices stored in memory to constrain parameter changes, mitigating forgetting while allowing for new task adaptation.
+    \item \textbf{Controller calibration}: Historical task complexity and drift information influence the controller’s decision-making, ensuring task-appropriate adaptation strategies.
+\end{itemize}
+
+The replay memory is updated continuously and provides a foundation for future task adaptation. Importantly, the system operates in a closed-loop, where each learning step influences subsequent embeddings, drift detection, and optimization decisions, creating a dynamic and self-correcting control system.
+
+\subsubsection*{2.5 Comparison with Static Meta-Learners}
+
+To highlight the novelty of our approach, Table~\ref{tab:system_compare} compares our system to existing meta-learning frameworks, such as MAML~\cite{finn2017maml}, ProtoNet~\cite{snell2017prototypical}, and MetaSGD~\cite{li2017metasgd}. While traditional methods do not account for distributional drift or task heterogeneity, our approach uniquely integrates drift detection, task routing, and adaptive control at runtime.
+
+\begin{table}[ht]
+\centering
+\caption{Comparison with static meta-learners and continual learners.}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & Drift-Aware & Task Routing & Hyperparam. Adaptation \\
+\midrule
+MAML~\cite{finn2017maml}       & \ding{55} & \ding{55} & \ding{55} \\
+ProtoNet~\cite{snell2017prototypical} & \ding{55} & \ding{55} & \ding{55} \\
+MetaSGD~\cite{li2017metasgd}    & \ding{55} & \ding{55} & \ding{51} (global) \\
+iCaRL~\cite{rebuffi2017icarl}   & \ding{55} & \ding{55} & \ding{55} \\
+\textbf{Ours}                  & \ding{51} & \ding{51} & \ding{51} (per-task) \\
+\bottomrule
+\end{tabular}
+\label{tab:system_compare}
+\end{table}
+\vspace{0.5em}
+\noindent\textbf{Notation:} 
+\ding{51} = Supported / Present; 
+\ding{55} = Not supported / Absent; 
+(per-task) = Adaptation is performed dynamically per task instance; 
+(global) = Adaptation is performed statically or globally.
+
+Our method stands apart by providing per-task adaptation, drift-aware feedback, and dynamic control, ensuring robust performance in the face of non-stationary task distributions.
+
+\subsubsection*{2.6 Summary}
+
+In this section, we introduced the closed-loop adaptive meta-learning framework, which combines task embedding, drift detection, controller modulation, and conditional optimization to create a dynamic and responsive learning system. Key advantages of our approach include:
+
+\begin{itemize}
+    \item \textbf{Task specificity}: Each task receives customized adaptation, ensuring efficient and effective learning.
+    \item \textbf{Modular extensibility}: The components of our system can be independently trained and replaced, facilitating experimentation and scaling.
+    \item \textbf{Efficiency under stability}: For tasks with low drift, efficient non-parametric inference is used to minimize computational overhead.
+    \item \textbf{Robustness under shift}: Tasks with significant drift are adaptively optimized with gradient-based regularization to prevent forgetting.
+\end{itemize}
+
+This system is designed to support continual learning in real-world environments with evolving task distributions, offering a highly adaptable, efficient, and scalable solution for continual few-shot learning.
+
+
+
+
+\subsection{Task Embedding Construction}
+
+\textbf{Motivation and Role in the System.}  
+In continual few-shot learning (CFSL), each task $\mathcal{T}_i$ consists of a support set $S_i$ sampled from a potentially novel class distribution. A key challenge is to effectively capture the structural properties of the task—such as class separability, internal feature variance, and similarity to previous tasks—without relying on large-scale labeled data. These properties are crucial for:
+
+\begin{itemize}
+    \item Determining whether a task represents \textbf{distributional drift}, i.e., a shift in task characteristics over time.
+    \item Selecting an appropriate learning strategy (e.g., rapid adaptation versus memory-preserving inference).
+    \item Modulating per-task hyperparameters such as learning rate and regularization strength.
+\end{itemize}
+
+To enable these functionalities, we introduce a \textbf{task embedding module} that maps the support set $S_i$ to a fixed-length vector representation $\mathbf{t}_i \in \mathbb{R}^{d_t}$. This vector encodes task-level semantics, including inter-class separability, intra-class variance, and task complexity, and serves as the input to both the drift detector and the adaptive controller.
+
+\subsubsection*{Problem Setup and Notation}
+
+Let $\mathcal{T}_i = (S_i, Q_i)$ be a few-shot classification task, where:
+\begin{itemize}
+    \item $S_i = \{(x_j^s, y_j^s)\}_{j=1}^{N_s}$ is the support set, consisting of $N$ classes with $K$ examples each (i.e., $N$-way $K$-shot).
+    \item $Q_i = \{(x_j^q, y_j^q)\}_{j=1}^{N_q}$ is the query set, used for evaluation purposes.
+\end{itemize}
+
+We define a feature extractor $f_\theta : \mathbb{R}^d \rightarrow \mathbb{R}^D$, typically a frozen CNN such as ResNet-12 or ResNet-18 pretrained on a base set. For each support sample, we extract:
+\[
+\mathbf{f}_j^s = f_\theta(x_j^s), \quad \mathbf{F}_i = [\mathbf{f}_1^s, \ldots, \mathbf{f}_{N_s}^s] \in \mathbb{R}^{D \times N_s}
+\]
+
+Our goal is to encode $\mathbf{F}_i$ into a fixed-length vector $\mathbf{t}_i$ that satisfies the following criteria:
+\begin{itemize}
+    \item \textbf{Invariance:} To permutations of support samples, ensuring that the embedding remains consistent regardless of input order.
+    \item \textbf{Sensitivity:} To inter-class separability and intra-class variability, which are key to distinguishing between tasks and their complexities.
+    \item \textbf{Compactness:} Suitable for downstream modules such as drift detection and memory comparison, while ensuring efficient memory usage.
+\end{itemize}
+
+\subsubsection*{Step 1: Global Feature Statistics}
+
+We begin by computing global statistics across the support set, which provide a first-order representation of the task’s central tendency and variability:
+\begin{align}
+    \mu_i &= \frac{1}{N_s} \sum_{j=1}^{N_s} \mathbf{f}_j^s, \quad 
+    \sigma_i = \sqrt{\frac{1}{N_s} \sum_{j=1}^{N_s} (\mathbf{f}_j^s - \mu_i)^2}
+\end{align}
+
+These vectors characterize the overall structure of the task. Tasks with high $\|\sigma_i\|$ indicate broad intra-class variance or unstructured class boundaries, which may reflect difficulty or ambiguity in the task structure.
+
+\subsubsection*{Step 2: Class-wise Prototype Encoding}
+
+Let $C = \{c_1, \ldots, c_N\}$ be the label set in $S_i$. For each class $c$, we define the set of support samples $S_c$ and compute the class prototype $\mathbf{p}_c$ as the mean feature vector for class $c$:
+\[
+S_c = \{x_j^s \mid y_j^s = c\}, \quad \mathbf{p}_c = \frac{1}{|S_c|} \sum_{x_j^s \in S_c} f_\theta(x_j^s)
+\]
+
+The set of prototypes $\{\mathbf{p}_c\}_{c=1}^N$ captures the task’s class centers in feature space, which helps the system compute rough task shape and inter-class separability. To measure class separability, we define:
+\[
+d_{\text{proto}} = \frac{2}{N(N-1)} \sum_{i<j} \|\mathbf{p}_i - \mathbf{p}_j\|_2
+\]
+A large $d_{\text{proto}}$ indicates clearer boundaries between classes, while smaller values suggest overlap or ambiguity.
+
+\subsubsection*{Step 3: Contextual Encoding via Transformer}
+
+To capture relationships among the features and further model the task’s underlying structure, we apply a single-layer Transformer encoder $T(\cdot)$ to the feature matrix $\mathbf{F}_i$:
+\[
+\mathbf{H}_i = T(\mathbf{F}_i) \in \mathbb{R}^{D \times N_s}, \quad 
+\mathbf{h}_{\text{ctx}} = \frac{1}{N_s} \sum_{j=1}^{N_s} \mathbf{H}_i[:,j]
+\]
+
+This context embedding $\mathbf{h}_{\text{ctx}}$ captures:
+\begin{itemize}
+    \item Alignment between support samples, allowing the system to understand the relationships within the task;
+    \item Implicit signals about prototype clustering, aiding in the identification of distinct class structures;
+    \item Anisotropic feature spread, revealing subtle feature dependencies not visible from $\mu_i$ and $\sigma_i$ alone.
+\end{itemize}
+
+We use multi-head attention (4 heads), hidden size 128, and dropout 0.1. Positional encoding is disabled to preserve permutation invariance, ensuring that the model’s understanding of the task remains order-agnostic.
+
+\subsubsection*{Step 4: Final Embedding Composition}
+
+Finally, we concatenate the components into a single fixed-length vector:
+\[
+\mathbf{t}_i = \text{Concat}[\mu_i, \sigma_i, \mathbf{p}_1, \ldots, \mathbf{p}_N, \mathbf{h}_{\text{ctx}}] \in \mathbb{R}^{d_t}
+\]
+For a task with $D = 128$, $N = 5$, and $D_h = 128$, the dimensionality of $\mathbf{t}_i$ becomes $d_t = 128 + 128 + 5 \cdot 128 + 128 = 896$.
+
+To ensure efficiency and memory compatibility, we apply a two-layer projection MLP to compress the embedding:
+\[
+\mathbf{t}_i \leftarrow \phi_{\text{proj}}(\mathbf{t}_i) \in \mathbb{R}^{512}
+\]
+
+\subsubsection*{Alternative Designs and Comparison}
+
+\textbf{Alternatives considered:}
+\begin{itemize}
+    \item \textbf{Averaged Support Pooling}: $\bar{\mathbf{f}} = \frac{1}{N_s} \sum \mathbf{f}_j^s$ simplifies the representation but discards class-specific structure;
+    \item \textbf{Per-class histograms}: These are ineffective in few-shot settings due to limited support examples ($K$ is small);
+    \item \textbf{LSTM encoder over feature list}: While effective in sequence modeling, LSTMs are sensitive to ordering and struggle with tasks having variable class counts;
+    \item \textbf{Meta-Baseline encoder~\cite{chen2021meta}}: Assumes a fixed classifier, limiting flexibility in dynamic environments with drift.
+\end{itemize}
+
+Our Transformer-based structure strikes a balance between generality, relational modeling, and robustness under drift, offering superior flexibility in few-shot, non-stationary settings.
+
+\subsubsection*{Empirical Justification}
+
+
+To empirically justify the effectiveness of our task embedding construction, we visualize t-SNE plots of task embeddings for drifted and stable tasks. Our analysis reveals:
+\begin{itemize}
+    \item Drifted tasks form distinct clusters in the embedding space, indicating separability in feature space;
+    \item Contextual embeddings increase the margin between in-domain tasks and out-of-domain tasks, highlighting the model’s ability to capture subtle drift signals;
+    \item Removing the context embedding $\mathbf{h}_{\text{ctx}}$ reduces the drift classifier AUC from 0.91 to 0.78, demonstrating the importance of contextual information for drift detection.
+\end{itemize}
+
+To empirically justify the effectiveness of our task embedding construction, we visualize t-SNE plots of task embeddings for drifted and stable tasks. Our analysis reveals:
+\begin{itemize}
+    \item Drifted tasks form distinct clusters in the embedding space, indicating separability in feature space;
+    \item Contextual embeddings increase the margin between in-domain tasks and out-of-domain tasks, highlighting the model’s ability to capture subtle drift signals;
+    \item Removing the context embedding $\mathbf{h}_{\text{ctx}}$ reduces the drift classifier AUC from 0.91 to 0.78, demonstrating the importance of contextual information for drift detection.
+\end{itemize}
+
+\subsubsection*{Embedding Construction Algorithm}
+
+The task embedding construction process is summarized in Algorithm.
+
+\begin{algorithm}[H]
+\caption{Task Embedding Construction}
+\begin{algorithmic}[1]
+\Procedure{EmbedTask}{$S_i$}
+    \State Extract $\mathbf{F}_i \gets \{f_\theta(x_j^s)\}$
+    \State Compute $\mu_i$, $\sigma_i$ over $\mathbf{F}_i$
+    \State Compute $\{\mathbf{p}_c\}$ by class average
+    \State Compute $\mathbf{H}_i \gets \text{Transformer}(\mathbf{F}_i)$
+    \State $\mathbf{h}_{\text{ctx}} \gets \text{MeanPool}(\mathbf{H}_i)$
+    \State Concatenate and project: $\mathbf{t}_i \leftarrow \phi_{\text{proj}}(\text{Concat}[\cdots])$
+    \State \Return $\mathbf{t}_i$
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection*{Summary and Contribution}
+
+This module achieves the following:
+\begin{itemize}
+    \item A high-capacity yet compact task representation that balances generality and task-specific information;
+    \item Robustness to class imbalance and support noise, with a built-in mechanism for addressing drift;
+    \item Improved task separability and accuracy in drift detection, enhancing overall system adaptability;
+    \item Plug-and-play generality, with no dependence on external labels or retraining.
+\end{itemize}
+
+The task embedding $\mathbf{t}_i$ forms the core signal that drives the rest of the system, including drift detection, controller routing, and memory comparison, ensuring adaptive learning across diverse tasks.
+
+\subsection{Hybrid Drift Detection Strategy}
+
+\textbf{Motivation.}  
+In continual few-shot learning (CFSL), tasks may evolve over time due to domain shifts, new class semantics, or covariate changes. This phenomenon, known as \emph{task drift}, violates the i.i.d. assumption in classical meta-learning~\cite{finn2017maml,snell2017prototypical}, which assumes that tasks are drawn from a fixed distribution. As task distributions shift, models that rely on static assumptions may fail to generalize effectively to new tasks. Task drift leads to degraded performance and catastrophic forgetting, which can severely hinder long-term learning in dynamic environments.
+
+An effective meta-learner must, therefore, answer the critical question for each new task $\mathcal{T}_i$:  
+\textit{Has this task significantly drifted from the training distribution or prior tasks?}
+
+To address this, we introduce a \textbf{hybrid drift detection module} that combines multiple signals:
+\begin{itemize}
+    \item \textbf{Statistical divergence} between task embeddings;
+    \item \textbf{Temporal mean shift} across the task history;
+    \item \textbf{Neural classifier} trained on pseudo-labeled task representations.
+\end{itemize}
+
+This fusion strategy improves robustness under low-shot conditions and noisy input features, where single-signal detectors may fail to identify meaningful drift.
+
+\subsubsection*{Overview of Inputs}
+
+Let $\mathbf{t}_i \in \mathbb{R}^{d_t}$ be the task embedding constructed from support set $S_i$ (see Section 1). The support set is composed of few labeled examples that define a given task. Let $\{\mathbf{t}_k\}_{k<i}$ be a memory of past task embeddings stored in a replay buffer $\mathcal{M}$, which provides a historical context for drift detection.
+
+The drift detector evaluates three independent signals:
+\[
+\text{Signal}_1 = \text{KL Divergence}  \quad
+\text{Signal}_2 = \text{Mean Shift}  \quad \]
+\[ \text{Signal}_3 = \text{Drift Classifier}
+\]
+
+A task is flagged as "drifted" if at least two of the three signals exceed predefined thresholds, indicating significant drift in the task distribution.
+
+\subsubsection*{1. KL Divergence between Gaussian-Modeled Tasks}
+
+We model each task embedding $\mathbf{t}_i$ as a Gaussian distribution with empirical mean $\mu_i$ and diagonal covariance $\sigma_i^2$, which allows us to treat the embedding as a soft distribution in semantic space. This approach provides a flexible representation of tasks, capturing both the mean shift and variance, which is crucial for detecting drift.
+
+\begin{figure*}[t]
+\centering
+\begin{equation*}
+D_{\mathrm{KL}}(\mathcal{N}(\mu_i, \sigma_i^2) \, \| \, \mathcal{N}(\mu_k, \sigma_k^2)) = 
+\frac{1}{2} \sum_{d=1}^{d_t} \left( \frac{\sigma_i^2[d]}{\sigma_k^2[d]} + \frac{(\mu_k[d] - \mu_i[d])^2}{\sigma_k^2[d]} - 1 - \log \frac{\sigma_i^2[d]}{\sigma_k^2[d]} \right)
+\end{equation*}
+\caption{KL divergence between current and past task distributions.}
+\label{eq:kl_divergence}
+\end{figure*}
+
+We compute the minimum KL divergence across all past tasks:
+\[
+\text{KL}_i = \min_{k<i} D_{\mathrm{KL}}(\mathbf{t}_i \| \mathbf{t}_k)
+\]
+
+\textbf{Drift Signal 1:}
+\[
+\text{Signal}_1 = \mathbb{1}[\text{KL}_i > \delta_{\mathrm{KL}}]
+\]
+Typical thresholds for KL divergence are $\delta_{\mathrm{KL}} = 1.0$–1.5, calibrated on a validation set.
+
+\paragraph{Why KL?}
+KL divergence captures shifts in both the mean and variance of distributions, which is critical for identifying distributional drift. Compared to Euclidean distance, KL respects the underlying distributional geometry and penalizes overlap between distributions differently. This property makes it particularly useful for detecting drift in online and sequential learning tasks~\cite{gama2014survey}.
+
+\subsubsection*{2. Temporal Mean Shift in Embedding Space}
+
+We also capture gradual drift by comparing the short-term and long-term means of the task embeddings. This signal helps detect drift that occurs slowly over time, which may not be immediately visible from pairwise KL divergence comparisons.
+
+Let:
+\begin{itemize}
+    \item $\mu_{\text{recent}}$: The average of the last $w$ task embeddings;
+    \item $\mu_{\text{past}}$: The average of the previous $w$ task embeddings.
+\end{itemize}
+
+Define the drift score based on the mean shift:
+\[
+\text{DriftScore}_{\text{shift}} = \|\mu_{\text{recent}} - \mu_{\text{past}}\|_2
+\]
+
+\textbf{Drift Signal 2:}
+\[
+\text{Signal}_2 = \mathbb{1}[\text{DriftScore}_{\text{shift}} > \delta_{\text{shift}}]
+\]
+
+We use a window size of $w = 5$–10, and $\delta_{\text{shift}}$ is tuned (e.g., between 0.3–0.5 depending on the scale of $d_t$).
+
+\paragraph{Interpretation.}
+This signal captures gradual domain transitions not immediately visible from the pairwise KL divergence. It assumes that tasks arrive in temporal order, as in a continual learning setup, and is robust to outliers or sporadic changes.
+
+\subsubsection*{3. Neural Drift Classifier}
+
+In addition to the statistical and temporal signals, we train a lightweight neural classifier $g_\phi: \mathbb{R}^{d_t} \rightarrow [0,1]$ to output a probability indicating whether a task has drifted:
+\[
+p_{\text{drift}} = \text{sigmoid}(g_\phi(\mathbf{t}_i))
+\]
+
+The classifier is trained on pseudo-labels derived from the first two drift signals:
+\[
+y_i^{\text{pseudo}} = 
+\begin{cases}
+1 & \text{if Signal}_1 + \text{Signal}_2 \geq 2 \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+\textbf{Drift Signal 3:}
+\[
+\text{Signal}_3 = \mathbb{1}[p_{\text{drift}} > \delta_{\text{MLP}}]
+\]
+
+This classifier improves robustness when the statistical signals are ambiguous or noisy. By learning task space geometry, it can also generalize to unseen drift types that may not be well-represented by statistical features alone.
+
+The classifier is implemented as a 2-layer MLP with hidden size 128 and dropout of 0.2. It is trained online using accumulated pseudo-labels and momentum updates.
+
+\subsubsection*{Fusion Strategy and Final Decision}
+
+To reduce false positives from noisy signals, we combine the three drift signals using majority voting:
+\[
+\text{Drift}(\mathcal{T}_i) = \mathbb{1}\left[\sum_{k=1}^3 \text{Signal}_k(\mathcal{T}_i) \geq 2 \right]
+\]
+
+\textbf{Advantages:}
+\begin{itemize}
+    \item Balances sensitivity and precision by integrating multiple signals;
+    \item Enables confidence calibration from soft classifier scores;
+    \item Allows fine-grained ablations, e.g., using only statistical or learned detectors.
+\end{itemize}
+
+\subsubsection*{Algorithm: Hybrid Drift Detection}
+
+The overall hybrid drift detection process is summarized in Algorithm.
+
+\begin{algorithm}[H]
+\caption{DriftDetection$(\mathbf{t}_i, \mathcal{M})$}
+\begin{algorithmic}[1]
+\State Compute KL divergence $\text{KL}_i$ to past $\mathbf{t}_k \in \mathcal{M}$
+\State Compute $\mu_{\text{past}}, \mu_{\text{recent}}$ from windowed mean
+\State Compute $p_{\text{drift}} = g_\phi(\mathbf{t}_i)$
+\State $\text{Signal}_1 \gets \text{KL}_i > \delta_{\mathrm{KL}}$
+\State $\text{Signal}_2 \gets \|\mu_{\text{past}} - \mu_{\text{recent}}\|_2 > \delta_{\text{shift}}$
+\State $\text{Signal}_3 \gets p_{\text{drift}} > \delta_{\text{MLP}}$
+\State \Return Drift$(\mathcal{T}_i) \gets \mathbb{1}[\text{Signal}_1 + \text{Signal}_2 + \text{Signal}_3 \geq 2]$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection*{Ablation: Contribution of Each Signal}
+
+In Section, we show:
+\begin{itemize}
+    \item Using only KL divergence reduces drift detection accuracy by 11.2\%;
+    \item Removing the neural classifier increases false negatives by 18.7\%;
+    \item Full hybrid model achieves 92.5\% drift detection accuracy on Mini-ImageNet stream.
+\end{itemize}
+
+\subsubsection*{Limitations and Discussion}
+
+\textbf{False negatives:} When drift is subtle and prototypes overlap with prior class space, all signals may fall below threshold. We address this with conservative thresholding and classifier smoothing.
+
+\textbf{Noise sensitivity:} KL divergence is sensitive to small variances. We regularize $\sigma_i$ and apply min-clipping to avoid numerical instability.
+
+\textbf{Task imbalance:} If recent memory includes few drifted tasks, the classifier may overfit to the stable pattern. We apply pseudo-label balancing during training.
+
+\subsubsection*{Summary and Impact}
+
+Our hybrid drift detector:
+\begin{itemize}
+    \item Combines statistical, temporal, and learned signals to provide robust drift detection;
+    \item Achieves high precision and recall under few-shot constraints;
+    \item Enables the controller to selectively apply adaptation only when necessary;
+    \item Forms the first line of defense against catastrophic forgetting in a dynamic learning environment.
+\end{itemize}
+
+This module is crucial for our closed-loop adaptive meta-learning framework, enabling robust learning in environments with temporal uncertainty and evolving task distributions.
+
+\subsection{Adaptive Controller and Strategy Selection}
+
+\textbf{Motivation.}  
+In continual few-shot learning (CFSL), tasks exhibit varying levels of complexity, novelty, and drift. A static adaptation strategy, such as always fine-tuning the model or using prototype-based inference, is either inefficient or prone to catastrophic forgetting, especially when faced with dynamic, evolving task distributions. In contrast, a meta-learner in a dynamic environment needs to continuously assess the task characteristics and adapt its learning strategy accordingly. 
+
+Inspired by principles of meta-decision learning~\cite{xu2021meta,rios2018few}, we propose an adaptive controller module that:
+\begin{itemize}
+    \item Dynamically selects between inference-based (\textsc{ProtoOnly}) and optimization-based (\textsc{MetaSGD + EWC}) strategies;
+    \item Adjusts per-task hyperparameters—learning rate $\eta_i$ and regularization strength $\lambda_i$—in response to drift and task complexity;
+    \item Balances fast plasticity for adapting to new tasks and long-term retention for preventing catastrophic forgetting.
+\end{itemize}
+
+The controller operates in a closed-loop with the drift detection module, relying on the task embedding $\mathbf{t}_i$ as its primary input to make informed decisions about task adaptation.
+
+\subsubsection*{Controller Inputs and Outputs}
+
+Let:
+\begin{itemize}
+    \item $\mathbf{t}_i \in \mathbb{R}^{d_t}$: task embedding derived from the support set $S_i$;
+    \item $D_i$: scalar drift score from the hybrid drift detection module (see Section 2);
+    \item $C_i$: scalar task complexity estimate (described below).
+\end{itemize}
+
+The controller computes:
+\[
+(\text{Strategy}_i, \eta_i, \lambda_i) \gets \text{Controller}(\mathbf{t}_i, D_i, C_i)
+\]
+
+\textbf{Output:}
+\begin{itemize}
+    \item \textsc{ProtoOnly}: Perform nearest-prototype inference, with no parameter updates.
+    \item \textsc{MetaSGD + EWC}: Perform inner-loop fine-tuning with adaptive learning rate and regularization based on drift and complexity.
+\end{itemize}
+
+\subsubsection*{1. Task Complexity Estimation}
+
+While drift captures \emph{novelty}, task complexity reflects the \emph{internal difficulty} of a task, such as class overlap, sample noise, or ambiguous decision boundaries. We estimate task complexity by measuring the variance of the task embedding across its components:
+\begin{equation}
+    C_i = \frac{1}{d_t} \sum_{j=1}^{d_t} (t_{i,j} - \bar{t}_i)^2, \quad \bar{t}_i = \frac{1}{d_t} \sum_j t_{i,j}
+\end{equation}
+
+\textbf{Interpretation:} Higher variance in the task embedding suggests greater internal disorder and complexity, indicating that a task may require stronger adaptation (i.e., a larger learning rate).
+
+\subsubsection*{2. Hyperparameter Modulation via Gated Hypernetwork}
+
+The learning rate $\eta_i$ and regularization strength $\lambda_i$ are conditioned on both the drift score $D_i$ and the task complexity $C_i$ using a two-branch gated network:
+\begin{align}
+    \eta_i &= \eta_0 \cdot \left(1 + \alpha C_i + \beta D_i \right) \\
+    \lambda_i &= \lambda_0 \cdot \left(1 + \gamma D_i \right)
+\end{align}
+
+\textbf{Explanation:}
+\begin{itemize}
+    \item $\alpha$: Controls the impact of task complexity on the learning rate, scaling with the internal difficulty of the task.
+    \item $\beta$: Links drift to learning urgency, indicating how much to adjust learning based on task drift.
+    \item $\gamma$: Links drift to memory preservation pressure, scaling regularization to prevent forgetting.
+\end{itemize}
+
+All coefficients $(\alpha, \beta, \gamma)$ are learnable during meta-training, allowing the system to learn how to adjust these parameters optimally based on task characteristics. We apply ReLU gating and layer normalization to stabilize the outputs and prevent overfitting.
+
+\subsubsection*{3. Routing Logic and Strategy Selection}
+
+The final decision logic integrates:
+\begin{itemize}
+    \item The drift score $D_i$ (typically normalized to [0,1]);
+    \item Confidence of the neural drift classifier $p_{\text{drift}}$ (as detailed in Section 2);
+    \item An empirically set threshold $\delta$ that determines the switching point for adaptation.
+\end{itemize}
+
+\[
+\text{Strategy}_i = 
+\begin{cases}
+\textsc{MetaSGD + EWC}, & \text{if } D_i > \delta \text{ or } p_{\text{drift}} > \delta_{\text{MLP}} \\
+\textsc{ProtoOnly}, & \text{otherwise}
+\end{cases}
+\]
+
+\paragraph{Rationale.}
+When tasks exhibit high novelty or feature instability, they are routed to the adaptation strategy (\textsc{MetaSGD + EWC}) to allow the model to learn new features. Conversely, stable tasks benefit from fast, memory-efficient inference using prototypes, which avoids unnecessary computational overhead and ensures efficient learning.
+
+\subsubsection*{Visualization: Controller Routing Behavior}
+
+To demonstrate the behavior of the controller in action, we visualize the changes in the learning rate $\eta_i$ and regularization strength $\lambda_i$ across tasks in Fig.~\ref{fig:controller_curve}. We observe clear spikes in both $\eta_i$ and $\lambda_i$ during detected drift periods (Tasks 30, 50, and 80), confirming that the controller responds promptly and effectively to drift.
+
+\begin{figure}[ht]
+\centering
+\includegraphics[width=0.9\linewidth]{figures/controller_routing_curve.png}
+\caption{Controller output ($\eta_i$, $\lambda_i$) across tasks. Notable spikes correspond to drift points (Tasks 30, 50, 80).}
+\label{fig:controller_curve}
+\end{figure}
+
+\subsubsection*{Algorithm: Task Adaptation via Controller}
+
+The algorithm for task adaptation using the controller is shown in Algorithm~\ref{alg:controller}. This process outlines how the controller receives task embeddings, drift detection results, and complexity estimates to decide on the most appropriate learning strategy.
+
+\begin{algorithm}[H]
+\caption{Adaptive Strategy Controller}
+\label{alg:controller}
+\begin{algorithmic}[1]
+\Procedure{AdaptTask}{$\mathcal{T}_i$, History}
+    \State $\mathbf{t}_i \gets \text{EmbedTask}(S_i)$
+    \State $D_i \gets \text{DriftDetection}(\mathbf{t}_i, \mathcal{M})$
+    \State $C_i \gets \text{Variance}(\mathbf{t}_i)$
+    \State $\eta_i \gets \eta_0 \cdot (1 + \alpha C_i + \beta D_i)$
+    \State $\lambda_i \gets \lambda_0 \cdot (1 + \gamma D_i)$
+    \If{$D_i > \delta$ \textbf{or} $p_{\text{drift}} > \delta_{\text{MLP}}$}
+        \State \Return \textsc{MetaSGD + EWC}, $\eta_i$, $\lambda_i$
+    \Else
+        \State \Return \textsc{ProtoOnly}, $\eta_0$, $\lambda_0$
+    \EndIf
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection*{Ablation: Is Controller Necessary?}
+
+We conduct ablation experiments to assess the necessity of the adaptive controller:
+\begin{itemize}
+    \item \textbf{Fixed strategy (MetaSGD)}: Good adaptation but high forgetting on drifted tasks.
+    \item \textbf{Fixed strategy (ProtoOnly)}: Fast inference but poor performance on drifted tasks.
+    \item \textbf{Random routing}: Poor stability and inconsistency in learning outcomes.
+    \item \textbf{Ours}: Achieves the best balance of retention and adaptation accuracy.
+\end{itemize}
+
+See Section ablation
+Table for quantitative results.
+
+\subsubsection*{Design Trade-offs and Limitations}
+
+\textbf{Simplified signals.} We rely on scalar estimates for drift and complexity. Future work could explore more sophisticated task representations, such as task graphs or temporal modeling.
+
+\textbf{Gating sensitivity.} Improper training of $\alpha, \beta, \gamma$ can lead to unstable learning rates $\eta_i$. We mitigate this issue through weight decay and schedule-aware training techniques.
+
+\textbf{Overreaction.} In some cases, false positives in drift detection may trigger unnecessary adaptation. We address this by employing conservative thresholding, signal smoothing, and ensemble voting techniques.
+
+\subsubsection*{Summary and Contribution}
+
+The adaptive controller is crucial for enabling:
+\begin{itemize}
+    \item Task-specific learning strategy selection based on drift and complexity;
+    \item Dynamic adjustment of learning rates and regularization strengths;
+    \item Efficient computation by avoiding unnecessary updates for stable tasks;
+    \item Robustness to distributional shifts and task diversity.
+\end{itemize}
+
+By combining semantic awareness with statistical guidance, the controller closes the loop in our meta-learning system, ensuring adaptive learning in the face of dynamic and evolving task distributions.
+
+
+\subsection{Conditional Optimization with MetaSGD and EWC}
+
+\textbf{Motivation.}  
+In continual few-shot learning (CFSL), tasks can vary greatly in their inherent complexity, novelty, and drift severity. Static adaptation strategies—such as always using nearest prototype inference or fine-tuning the model with a fixed learning rate—are either inefficient or prone to catastrophic forgetting, especially when the task distribution shifts. In dynamic environments, a meta-learner must determine the optimal strategy for each task based on its unique characteristics. 
+
+To resolve this tension, we introduce a conditional optimization strategy that combines:
+\begin{itemize}
+    \item \textbf{MetaSGD}~\cite{li2017metasgd}, which allows fast adaptation by associating each parameter with a learned learning rate;
+    \item \textbf{EWC}~\cite{kirkpatrick2017ewc}, which constrains important weights to prevent forgetting of prior knowledge.
+\end{itemize}
+
+This combination ensures that the model can quickly adapt to new tasks (plasticity) while maintaining stability on previous tasks (retention). These strategies are applied only to tasks selected by the controller (Section 3), ensuring both \textit{plasticity} and \textit{stability} under dynamic conditions.
+
+\subsubsection*{Conditional Path Activation}
+
+Let $\mathcal{T}_i = (S_i, Q_i)$ be a task that the controller has routed to \textsc{MetaSGD + EWC} for adaptation. The goal is to adapt the model $f_\theta$ using $S_i$ and produce accurate predictions on $Q_i$, while also retaining performance on prior tasks.
+
+\paragraph{Notation:}
+\begin{itemize}
+    \item $\theta$: current model parameters;
+    \item $\eta_j$: learned learning rate for parameter $\theta_j$;
+    \item $F_j$: Fisher information for $\theta_j$, estimated over prior tasks;
+    \item $\theta_j^*$: parameter value after last stable adaptation.
+\end{itemize}
+
+\subsubsection*{1. MetaSGD Inner-Loop Adaptation}
+
+MetaSGD enhances standard gradient descent by associating each parameter $\theta_j$ with a learned step size $\eta_j$:
+
+\begin{equation}
+    \theta_j' = \theta_j - \eta_j \cdot \frac{\partial \mathcal{L}_{\mathcal{T}_i}}{\partial \theta_j}
+\end{equation}
+
+This modification enables the model to learn not only which parameters to update but also \textit{how fast} to update each parameter.
+
+\textbf{Meta-training Objective:}
+\[
+\min_{\theta, \{\eta_j\}} \mathbb{E}_{\mathcal{T}_i \sim \mathcal{D}} \left[ \mathcal{L}_{\text{query}}(f_{\theta_i'}, Q_i) \right]
+\]
+
+\paragraph{Advantages over MAML:}
+\begin{itemize}
+    \item No need for second-order gradients, making the method more computationally efficient and stable;
+    \item Each parameter has a separate learning rate, allowing for more fine-grained control over updates;
+    \item Better suited for non-iid continual task streams, as each task can adapt independently.
+\end{itemize}
+
+\subsubsection*{2. Fisher Information Estimation (EWC)}
+
+EWC helps to prevent catastrophic forgetting by constraining updates to parameters that are important for previously learned tasks. To quantify the importance of each parameter, we use the Fisher Information Matrix $F_j$:
+
+\begin{equation}
+F_j = \mathbb{E}_{(x, y) \sim \mathcal{B}} \left[ \left( \frac{\partial \mathcal{L}(f_\theta(x), y)}{\partial \theta_j} \right)^2 \right]
+\end{equation}
+
+where $\mathcal{B}$ is a buffer of prior task samples, either from replay or synthetic data. To efficiently estimate the Fisher Information, we use:
+\begin{itemize}
+    \item Online Fisher approximation with Exponential Moving Average (EMA);
+    \item Only compute gradients for the support set, as these represent the most important task-specific features;
+    \item Store $F_j$ per parameter using cumulative averaging.
+\end{itemize}
+
+\subsubsection*{3. Elastic Weight Consolidation (EWC) Penalty}
+
+EWC adds a penalty term to the loss function to constrain important parameters from deviating significantly from their values after prior task adaptations:
+
+\begin{equation}
+\mathcal{L}_{\text{EWC}} = \lambda_i \sum_j F_j \cdot (\theta_j - \theta_j^*)^2
+\end{equation}
+
+\textbf{Key Points:}
+\begin{itemize}
+    \item $\lambda_i$ is task-specific and controlled by the adaptive controller;
+    \item The penalty is quadratic and parameter-specific, ensuring that only important parameters are preserved;
+    \item Parameters with higher $F_j$ (more important) are penalized more heavily to retain prior knowledge.
+\end{itemize}
+
+\paragraph{Interpretation.}
+The EWC penalty can be interpreted as a Bayesian approximation to preserving the posterior distribution over important weights~\cite{zenke2017continual}, making it an effective tool for memory retention in continual learning scenarios.
+
+\subsubsection*{4. Combined Loss and Optimization Flow}
+
+The total adaptation loss used during the inner loop is the sum of the task loss and the EWC penalty:
+
+\begin{equation}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{EWC}}
+\end{equation}
+
+where $\mathcal{L}_{\text{task}}$ is computed over the support set $S_i$ and optionally validated on the query set $Q_i$. We use Adam optimizer with per-layer learning rates initialized from $\{\eta_j\}$.
+
+\subsubsection*{5. Parameter Snapshot and Memory Update}
+
+After adaptation, we update the memory buffer to store the new model state and Fisher information for future reference:
+\begin{itemize}
+    \item Store the updated parameters: $\theta^* \gets \theta_i'$ as the new baseline for future tasks;
+    \item Update the Fisher information $F_j$ using fresh gradients from $S_i$;
+    \item Save the summary into the memory buffer $\mathcal{M}$ for future drift detection and comparison.
+\end{itemize}
+
+This ensures that long-term retention is achieved without the need for full rehearsal of previous tasks.
+
+\subsubsection*{Algorithm: MetaSGD + EWC Adaptation}
+
+The algorithm for task adaptation with MetaSGD and EWC is outlined in Algorithm. This process shows how the model adapts based on drift detection, adjusting hyperparameters and updating model parameters accordingly.
+
+\begin{algorithm}[H]
+\caption{ConditionalAdaptation$(\mathcal{T}_i)$}
+\begin{algorithmic}[1]
+\If{Strategy = \textsc{MetaSGD + EWC}}
+    \State Compute gradients $\nabla_\theta \mathcal{L}_{\text{task}}$
+    \State Update $\theta' \gets \theta - \eta \cdot \nabla$
+    \State Compute $F_j$ from gradients
+    \State $\mathcal{L}_{\text{EWC}} \gets \lambda_i \sum_j F_j (\theta_j' - \theta_j^*)^2$
+    \State Total loss $\mathcal{L}_{\text{total}} \gets \mathcal{L}_{\text{task}} + \mathcal{L}_{\text{EWC}}$
+    \State Backpropagate and update $\theta, \eta_j$
+    \State Store $\theta_j^*, F_j$ in memory
+\Else
+    \State Use ProtoNet inference only
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection*{Comparative Analysis}
+
+The following table compares the performance of different strategies:
+
+\begin{table}[ht]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{@{} lcccc @{}}
+\toprule
+\textbf{Strategy} & \textbf{Adaptation} & \textbf{Retention} & \textbf{Speed} & \textbf{Drift Robustness} \\
+\midrule
+ProtoNet & \ding{55} & \ding{51} & \ding{51} & \ding{55} \\
+MetaSGD Only & \ding{51} & \ding{55} & \ding{55} & \ding{51} \\
+MetaSGD + EWC & \ding{51} & \ding{51} & \ding{108} & \ding{51}\ding{51} \\
+Ours (Controlled) & \ding{51}\ding{51} & \ding{51} & \ding{51} & \ding{51}\ding{51} \\
+\bottomrule
+\end{tabular}
+\caption{Qualitative comparison across adaptation speed, knowledge retention, and robustness to drift.}
+\label{tab:qualitative_comparison}
+\end{table}
+
+
+\textbf{Result:} Our conditional optimization approach balances adaptation, retention, and computational efficiency, providing the best performance in dynamic and evolving environments.
+
+\subsubsection*{Summary and Contribution}
+
+This conditional optimization module provides:
+\begin{itemize}
+    \item Rapid adaptation through MetaSGD for drifted tasks;
+    \item Forgetting suppression via EWC for previously learned tasks;
+    \item Conditional use based on task drift, reducing overhead for stable tasks;
+    \item Modular plug-in to the overall controller policy for task-specific learning.
+\end{itemize}
+
+By combining the strengths of MetaSGD and EWC, our method ensures adaptive, efficient, and robust learning in the face of dynamic task distributions, enhancing the overall continual learning framework.
+
+\subsection{System Workflow and Replay Memory}
+
+\textbf{Overview.}  
+In this section, we describe how the proposed modules—task embedding, drift detection, adaptive controller, and conditional optimizer—work together in sequence during continual task execution. The system operates in a \textbf{closed-loop pipeline}, where downstream decisions and updates are based on upstream observations. This closed-loop structure ensures that the system can dynamically adjust to new tasks while retaining knowledge from past tasks, which is crucial for handling non-stationary environments.
+
+The primary advantages of this system include:
+\begin{itemize}
+    \item Semantic awareness through task embeddings that capture task characteristics such as class separability, feature variance, and complexity;
+    \item Dynamic adaptation triggered only when task novelty is detected, minimizing unnecessary computation;
+    \item Regularized optimization for tasks that require stability and retention of previously learned knowledge;
+    \item Continuous memory consolidation through buffer updates, which store and compare past tasks to aid in drift detection and memory preservation.
+\end{itemize}
+
+\subsubsection*{1. High-Level System Flow}
+\vspace{0.8em}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    x=2.8cm, y=1.8cm,
+    box/.style={
+        draw,
+        rectangle,
+        rounded corners=3pt,
+        minimum width=2.8cm,
+        minimum height=1.1cm,
+        align=center,
+        fill=gray!10,
+        font=\footnotesize
+    },
+    arrow/.style={
+        -{Stealth[scale=1.2]},
+        line width=0.6pt,
+        shorten >=3pt,
+        shorten <=3pt
+    },
+    dashedarrow/.style={
+        arrow,
+        dash pattern=on 3pt off 2pt,
+        gray!60
+    }
+]
+
+% 主流程节点
+\node[box] (input) at (0, 0) {Support Set $S_i$};
+\node[box] (embed) at (0, -1) {Task Embedding $\mathbf{t}_i$};
+\node[box] (drift) at (0, -2) {Drift Detection};
+\node[box] (buffer) at (0, -3) {Replay Memory $\mathcal{M}$};
+
+% 控制器与策略模块
+\node[box] (controller) at (2.2, -1.5) {Controller: $\eta_i$, $\lambda_i$, path};
+\node[box] (strategy) at (2.2, -3) {Strategy Selector};
+
+% 输出模块（对称排布）
+\node[box] (proto) at (1.2, -4.3) {ProtoNet Inference};
+\node[box] (meta) at (3.2, -4.3) {MetaSGD + EWC};
+
+% 主流程箭头
+\draw[arrow] (input) -- (embed);
+\draw[arrow] (embed) -- (drift);
+\draw[arrow] (drift) -- (buffer);
+
+% 控制器路径
+\draw[arrow] (embed.east) to[out=0, in=180] (controller.west);
+\draw[arrow] (drift.east) to[out=0, in=180] ($(controller.west)+(0,-0.2)$);
+\draw[arrow] (controller.south) -- (strategy.north);
+
+% 策略分发箭头（居中指向模块顶部）
+\draw[arrow] (strategy.south) -- (proto.north);
+\draw[arrow] (strategy.south) -- (meta.north);
+
+% 虚线连接（Replay → Strategy）
+\draw[dashedarrow] (buffer.east) to[out=0, in=180] (strategy.west);
+
+% 插入X光图像（任务输入模块）
+\node[anchor=east] at ($(input.west) + (-0.15, 0)$) {\includegraphics[width=1.45cm]{figures/X-ray.png}};
+
+% 插入热图（漂移检测模块）
+\node[anchor=east] at ($(drift.west) + (-0.15, 0)$) {\includegraphics[width=1.45cm]{figures/heat.png}};
+
+\end{tikzpicture}
+\caption{System pipeline with refined alignment, compact structure, and double-column width. Drift detection illustrated by an example medical image\cite{wang2017chestxray}.}
+\label{fig:system_pipeline}
+\end{figure*}
+
+
+
+The system architecture is highly modular. At each time step, a task $\mathcal{T}_i$ undergoes the following stages:
+\begin{enumerate}
+    \item \textbf{Embedding}: The support set $S_i$ is processed to generate a task embedding $\mathbf{t}_i$, capturing key task semantics through the Transformer and statistical features.
+    \item \textbf{Drift Estimation}: Drift signals ($D_i$, $p_{\text{drift}}$) are computed using the hybrid drift detection module, which compares the current task with previous tasks stored in the memory buffer.
+    \item \textbf{Controller Decision}: The adaptive controller uses the task embedding $\mathbf{t}_i$ and drift information to select an appropriate learning strategy and set the learning rate $\eta_i$ and regularization strength $\lambda_i$.
+    \item \textbf{Adaptation Execution}: Based on the selected strategy, the system either adapts the model using MetaSGD + EWC or performs inference using ProtoNet.
+    \item \textbf{Memory Update}: The task embedding, Fisher matrices, and updated parameters are stored in the replay memory $\mathcal{M}$ for future drift detection and task comparison.
+\end{enumerate}
+
+\subsubsection*{2. Replay Memory Buffer $\mathcal{M}$}
+
+Replay memory plays a critical role in supporting drift detection and knowledge retention. We maintain a lightweight replay buffer:
+\[
+\mathcal{M} = \{ (\mathbf{t}_k, F_k, \theta_k^*) \}_{k < i}
+\]
+where $\mathbf{t}_k$ represents task embeddings, $F_k$ represents Fisher information for task $k$, and $\theta_k^*$ is the parameter snapshot after adaptation.
+
+\textbf{Functions of $\mathcal{M}$:}
+\begin{itemize}
+    \item \textbf{Drift detection}: Historical task statistics are used to calculate divergence measures like KL divergence and mean shift for drift estimation.
+    \item \textbf{EWC regularization}: Fisher matrices stored in memory help constrain parameter updates, preventing forgetting of past tasks.
+    \item \textbf{Controller guidance}: The memory helps the controller make informed decisions about task complexity and drift, ensuring task-specific adaptation.
+\end{itemize}
+
+\paragraph{Memory Policy.}  
+We use a sliding window FIFO policy for memory management, with a fixed buffer size $|\mathcal{M}| = M_{\text{max}}$ (e.g., 30–50 tasks). Alternatively, we can apply a diversity-based replacement policy, where less-representative tasks are replaced by new tasks using clustering in the prototype space~\cite{rebuffi2017icarl}.
+
+\paragraph{Memory Size–Performance Tradeoff.}
+We perform ablation experiments to evaluate the effect of memory size on performance. In Section, we demonstrate that performance degrades only slightly when the buffer size $M_{\text{max}}$ is reduced from 50 to 10, confirming the scalability of the approach.
+
+\subsubsection*{3. Deployment Loop: Full Algorithm}
+
+The overall workflow is summarized in Algorithm~\ref{alg:continual_system}. Each task passes through the stages described above, with the system continuously adapting and updating its memory and model parameters.
+
+\begin{algorithm}[H]
+\caption{Continual Few-Shot Learning (Online Phase)}
+\label{alg:continual_system}
+\begin{algorithmic}[1]
+\For{each task $\mathcal{T}_i = (S_i, Q_i)$}
+    \State $\mathbf{t}_i \gets \text{EmbedTask}(S_i)$
+    \State $(D_i, p_{\text{drift}}) \gets \text{DriftDetect}(\mathbf{t}_i, \mathcal{M})$
+    \State $(\text{strategy}, \eta_i, \lambda_i) \gets \text{Controller}(\mathbf{t}_i, D_i)$
+    \If{strategy == \textsc{MetaSGD + EWC}}
+        \State Adapt model with $\mathcal{L}_{\text{task}} + \mathcal{L}_{\text{EWC}}$
+        \State Update $\theta^*, F_j$
+    \Else
+        \State Use nearest-prototype classifier
+    \EndIf
+    \State Store $(\mathbf{t}_i, F_j, \theta^*)$ in $\mathcal{M}$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection*{4. System Properties}
+
+The system exhibits several key properties:
+\textbf{Efficiency:} Most tasks are routed to ProtoOnly, which allows the system to operate with minimal computational overhead for stable tasks.
+\textbf{Scalability:} The model’s state and memory size grow sub-linearly with the number of tasks, ensuring scalability in long-term deployments.
+\textbf{Interpretability:} Task embeddings and controller outputs are visualizable (see t-SNE plots in Section), making it easy to monitor how the system is adapting to different tasks.
+\textbf{Flexibility:} All modules are modular, meaning that components can be independently replaced or improved, enabling flexible system extensions and improvements.
+
+\subsubsection*{5. Timeline Diagram of Task Flow and System Response}
+
+To further illustrate the system’s behavior over time, we visualize the task processing and adaptation strategy switching in Fig.~\ref{fig:enhanced_task_timeline}. This diagram shows how the system switches from memory-efficient inference to adaptive updates when drift is detected, ensuring the balance between computational efficiency and adaptation.
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    task/.style={
+        rectangle, 
+        draw, 
+        rounded corners=3pt,
+        minimum width=2cm,
+        minimum height=1cm,
+        align=center,
+        font=\small
+    },
+    normal/.style={
+        task,
+        fill=blue!10,
+        text=black
+    },
+    drifted/.style={
+        task,
+        fill=red!25,
+        text=black,
+        draw=red!80,
+        line width=1pt
+    },
+    arrow/.style={
+        ->, 
+        >=Stealth,
+        thick, 
+        shorten >=2pt, 
+        shorten <=2pt
+    },
+    method/.style={
+        below,
+        font=\footnotesize,
+        text height=1.5ex,
+        text depth=0.25ex
+    } 
+]
+
+% ===== 图标题 =====
+\node[above=1cm, font=\small\bfseries] (title) {Task Stream Timeline with Adaptation Strategies};
+
+% ===== 任务节点 =====
+\node[normal] (t1) {Task 1};
+\node[normal, right=of t1] (t2) {Task 2};
+\node[drifted, right=of t2] (t3) {Task 3 (Drift)};
+\node[normal, right=of t3] (t4) {Task 4};
+\node[drifted, right=of t4] (t5) {Task 5 (Drift)};
+
+% ===== 箭头连接 =====
+\foreach \i/\j in {t1/t2, t2/t3, t3/t4, t4/t5} {
+    \draw[arrow] (\i) -- (\j);
+}
+
+% ===== 方法标签 =====
+\node[method] at (t1.south) {ProtoOnly};
+\node[method] at (t2.south) {ProtoOnly};
+\node[method, red!70!black] at (t3.south) {MetaSGD + EWC};
+\node[method] at (t4.south) {ProtoOnly};
+\node[method, red!70!black] at (t5.south) {MetaSGD + EWC};
+
+% ===== 虚线分割线 =====
+\draw[dashed, gray!50] ([yshift=-5mm]t1.south west) -- ([yshift=-5mm]t5.south east);
+
+% ===== 图例（Legend）=====
+\begin{scope}[shift={(0,-2)}]
+    \node[anchor=west, normal] at (0,0) (leg1) {};
+    \node[right=0.2cm of leg1, anchor=west] {Normal Task};
+    \node[below=0.3cm of leg1, anchor=west, drifted] (leg2) {};
+    \node[right=0.2cm of leg2, anchor=west] {Drifted Task};
+\end{scope}
+
+\end{tikzpicture}
+
+\caption{Sequential task processing with drift-triggered adaptation. Color coding indicates when the controller switches from ProtoOnly to MetaSGD+EWC to handle distribution shifts.}
+\label{fig:enhanced_task_timeline}
+\end{figure*}
+
+This visualization demonstrates how the system triggers adaptation only during drift periods, ensuring computational efficiency without sacrificing performance.
+
+\subsubsection*{Summary}
+
+This section detailed the integration of the key modules in our system:
+\begin{itemize}
+    \item Drift-aware task routing through the adaptive controller;
+    \item Selective optimization via MetaSGD + EWC for drifted tasks;
+    \item Lightweight memory replay for long-term regularization and drift detection;
+    \item Fully autonomous, closed-loop continual learning pipeline.
+\end{itemize}
+
+Together, these components ensure robust, efficient, and scalable continual few-shot learning under dynamic, real-world task streams.
+
+
+\section{Results and Analysis}
+
+This section provides a comprehensive evaluation of our method based on four key questions, which help to assess the effectiveness and robustness of the proposed framework in various continual few-shot learning scenarios.
+
+\paragraph{(Q1) Does it outperform baselines under continual drift?}  
+We begin by comparing our method against several state-of-the-art baselines in the context of continual drift. Specifically, we evaluate how well each method performs under different types of task drift (e.g., label shift, domain shift) and assess its ability to preserve performance while adapting to new tasks. This evaluation tests whether our approach, which combines drift detection, task-specific adaptation, and regularization, outperforms traditional meta-learning methods like ProtoNet, MAML, and MetaSGD in dynamic environments where task distributions evolve over time.
+
+\paragraph{(Q2) What is the contribution of each component?}  
+Next, we conduct an ablation study to quantify the impact of each individual component in our system. This includes evaluating the effectiveness of the task embedding module, drift detection, adaptive controller, and conditional optimization (MetaSGD + EWC). By removing or replacing each component, we measure how much performance is lost and identify which elements are crucial for achieving robust continual learning. This analysis provides insights into the value of each part of the system and how they contribute to the overall performance.
+
+\paragraph{(Q3) Is the controller responding correctly to drift?}  
+We focus on assessing the performance of the adaptive controller in detecting drift and adjusting the learning process accordingly. This includes evaluating whether the controller correctly identifies when drift occurs, adjusts the learning rate and regularization strength, and selects the appropriate adaptation strategy (e.g., using MetaSGD + EWC for drifted tasks). We visualize and quantify the controller’s decision-making process during drift events, ensuring that it dynamically allocates resources and ensures efficient adaptation while preventing forgetting.
+
+\paragraph{(Q4) How well does it generalize across datasets?}  
+Finally, we examine the generalization performance of our method across different datasets, including both visual and non-visual tasks. We test our system on the Meta-Dataset, which consists of tasks from diverse domains, including image classification, few-shot learning, and object detection. This evaluation helps us assess whether our approach can generalize to a variety of task distributions and whether it can maintain high performance across different data sources, highlighting its scalability and versatility in real-world applications.
+
+---
+
+This section is designed to provide a thorough understanding of the strengths and limitations of our method. Each of the four questions addresses a fundamental aspect of continual learning in dynamic environments, and together, they offer a comprehensive evaluation of how well our framework performs under challenging conditions.
+
+
+\subsection{5.1 Experimental Setup}
+
+\textbf{Continual Task Stream.}  
+We simulate a continual few-shot learning environment consisting of 100 tasks, each in a 5-way 5-shot format. In this setup, each task involves training on a support set $S_i$ consisting of $5$ classes, each with $5$ labeled examples, followed by evaluation on a query set $Q_i$. To model real-world scenarios where task distributions evolve over time, we inject a distributional drift every 10 tasks. This drift occurs through class shifts (where some classes are added or removed) or domain changes (e.g., style changes or feature variations). These periodic drifts mimic the challenges encountered in many applications, such as robotics, personalized recommendation systems, and medical diagnostics, where the environment or data distribution shifts continuously.
+
+\textbf{Datasets.}  
+We evaluate our method on three benchmark datasets, each offering unique challenges for continual few-shot learning:
+
+\begin{itemize}
+    \item \textbf{Mini-ImageNet~\cite{vinyals2016matching}}: A widely used few-shot learning dataset, consisting of 100 classes and 600 images per class, split into training (64 classes), validation (16 classes), and test (20 classes) sets. Mini-ImageNet provides a challenging environment due to its diversity of object categories and relatively high visual complexity.
+    \item \textbf{Omniglot~\cite{lake2015human}}: Known as the "handwritten character dataset," Omniglot consists of 50 alphabets, each containing 20 characters. The dataset offers a great challenge for few-shot learning, particularly with high intra-class variance in characters, making it suitable for evaluating drift and class separability.
+    \item \textbf{Meta-Dataset~\cite{triantafillou2019meta}}: A more complex dataset designed for meta-learning, containing 10 different datasets (e.g., CUB, Aircraft, Fungi). Meta-Dataset provides a broader range of task types and domains, which is particularly useful for testing our system's generalization ability and robustness across a wide range of domains and data distributions.
+\end{itemize}
+
+Each of these datasets presents unique challenges, from image classification and object recognition to domain-specific variations, making them ideal for evaluating the scalability and adaptability of continual learning models.
+
+\textbf{Metrics.}  
+To comprehensively evaluate the performance of our method, we use several key metrics, summarized in Table~\ref{tab:evaluation_matrix}:
+
+\begin{itemize}
+    \item \textbf{New Task Accuracy (NTA)}: The accuracy of the model on the query set of the current task after adaptation. This metric evaluates the model's ability to quickly adapt to new tasks with limited labeled data.
+    \item \textbf{Old Task Retention (OTR)}: The accuracy of the model on previously learned tasks after adaptation. This metric measures how well the model retains knowledge from earlier tasks, addressing catastrophic forgetting.
+    \item \textbf{Forgetting Rate (FR)}: The mean drop in performance on past tasks after adaptation to the current task. A lower forgetting rate indicates better long-term retention.
+    \item \textbf{Drift Detection Accuracy (DDA)}: The accuracy of the system in detecting whether a task has drifted or not. This metric tests the ability of the drift detection module to identify shifts in task distribution.
+    \item \textbf{Controller Adjustment Score (CAS)}: The variance of the learning rate $\eta_i$ and regularization strength $\lambda_i$ across tasks. A high CAS score indicates that the controller is responsive to task drift, while a low score suggests limited adaptation.
+    \item \textbf{Adaptation Time (AT)}: The average time taken to adapt to each task. This metric helps assess the efficiency of our method, particularly in real-time applications where time is crucial.
+\end{itemize}
+
+\begin{table}[ht]
+\centering
+\caption{Evaluation metrics for continual meta-learning.}
+\begin{tabular}{@{}p{2.8cm} p{3.7cm} p{1.2cm}@{}}
+\toprule
+\textbf{Metric} & \textbf{Description} & \textbf{Goal} \\
+\midrule
+NTA & Accuracy on current task query set & High \\
+OTR & Accuracy on replayed previous queries & High \\
+FR & Mean drop from max past accuracy & Low \\
+DDA & Correctly predicted drift/no-drift & High \\
+CAS & Variance of $(\eta_i, \lambda_i)$ over tasks & Balanced \\
+AT & Avg. seconds to adapt to each task & Low \\
+\bottomrule
+\end{tabular}
+\label{tab:evaluation_matrix}
+\end{table}
+
+\textbf{Baselines.}  
+We compare our method against several baseline models:
+\begin{itemize}
+    \item \textbf{ProtoNet~\cite{snell2017prototypical}}: A widely used approach in few-shot learning, based on nearest-prototype classification. This method serves as a non-adaptive baseline for comparison.
+    \item \textbf{ProtoNet + EWC}: A variant of ProtoNet that incorporates Elastic Weight Consolidation (EWC) for retaining past knowledge. This baseline helps to evaluate the effectiveness of drift detection and task-specific adaptation.
+    \item \textbf{MetaSGD (no controller)}: A meta-learning approach that learns per-parameter learning rates but does not include drift detection or a task-aware controller.
+    \item \textbf{MAML~\cite{finn2017maml}}: A classical meta-learning method that uses second-order optimization to enable fast adaptation. MAML serves as a strong baseline for comparison in meta-learning tasks.
+    \item \textbf{iCaRL~\cite{rebuffi2017icarl}}: A continual learning method that utilizes a memory buffer for task replay. iCaRL is useful for testing our system's performance in terms of task retention and drift adaptation.
+\end{itemize}
+
+\textbf{Implementation.}  
+We use a frozen ResNet-18 backbone pre-trained on the base set of each dataset. The drift detection module uses a memory buffer size of 20 and a KL divergence threshold of 0.8 to trigger drift detection. The adaptive controller's hyperparameters are set to $(\alpha, \beta, \gamma) = (0.5, 1.0, 1.0)$, which control the sensitivity to task complexity and drift.
+
+\vspace{0.5em}
+
+
+\subsection{5.2 Overall Performance under Drift (Q1)}
+
+\textbf{Objective.}  
+In this section, we evaluate our method’s overall effectiveness under distributional drift, which simulates real-world scenarios where task distributions evolve over time due to factors such as label shifts, domain changes, or semantic drift. We assess the ability of our approach to adapt quickly to new tasks while retaining knowledge of previously learned tasks, and measure its robustness to drift across different types of distribution shifts.
+
+\textbf{Main Results.}  
+Table~\ref{tab:main_results} summarizes the results of our method compared to several baselines across key evaluation metrics. Our approach consistently outperforms all baseline methods, achieving the highest scores for New Task Accuracy \textbf{(NTA)}, Old Task Retention \textbf{(OTR)}, and Drift Detection Accuracy \textbf{(DDA)}, while simultaneously minimizing the Forgetting Rate \textbf{(FR)}.
+
+\begin{table}[ht]
+\centering
+\caption{Overall performance under drift on Mini-ImageNet and Omniglot.}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{NTA $\uparrow$} & \textbf{OTR $\uparrow$} & \textbf{FR $\downarrow$} \\
+\midrule
+MAML                    & 69.8  & 47.3  & 11.2 \\
+iCaRL                   & 64.5  & 58.1  & 7.4  \\
+ProtoNet                & 65.2  & 41.3  & 15.7 \\
+ProtoNet + EWC          & 66.8  & 52.9  & 10.6 \\
+MetaSGD (No Controller) & 71.5  & 54.4  & 8.2  \\
+\textbf{Ours (Full)}    & \textbf{74.3}  & \textbf{60.8}  & \textbf{5.3}  \\
+\bottomrule
+\end{tabular}
+\label{tab:main_results}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\caption{Additional metrics: Drift Detection and Controller Performance.}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{DDA $\uparrow$} & \textbf{CAS} & \textbf{AT (s) $\downarrow$} \\
+\midrule
+MAML                    & 48.7  & --    & 0.26 \\
+iCaRL                   & 50.2  & --    & 0.30 \\
+ProtoNet                & 49.5  & --    & 0.12 \\
+ProtoNet + EWC          & 53.8  & --    & 0.14 \\
+MetaSGD (No Controller) & 55.4  & 0.11  & 0.22 \\
+\textbf{Ours (Full)}    & \textbf{92.5} & \textbf{0.27} & \textbf{0.24} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\textbf{Analysis.}  
+Compared to ProtoNet, our model improves NTA by +9.1\% and reduces FR by 10.4 percentage points. Our approach also shows a substantial improvement in old task retention (OTR), outperforming MetaSGD (no controller) by +6.4 points. This indicates that our model not only adapts to new tasks effectively but also retains knowledge of previous tasks, addressing the issue of catastrophic forgetting in continual learning scenarios.
+
+When compared to iCaRL, our model achieves higher retention with significantly less forgetting. The enhanced drift detection accuracy (92.5\%) demonstrates the ability of our drift detection module to identify distributional changes accurately. Furthermore, the controller’s adjustment score (CAS) remains moderate, ensuring that the model adapts to task changes without overreacting. Despite the additional modules for drift detection and adaptation, the time cost per task remains under 0.25 seconds, which is computationally efficient and suitable for real-time applications.
+
+In summary, our approach effectively balances rapid adaptation to new tasks, memory retention for past tasks, and sensitivity to drift, while maintaining efficiency in terms of both adaptation time and computational overhead.
+
+\textbf{Conclusion.}  
+These results confirm that our method is well-suited for continual learning under distributional drift. By combining drift detection, task-specific adaptation, and regularization, our system outperforms existing methods across all key metrics. The ability to maintain high performance on both new and old tasks, while minimizing forgetting and efficiently detecting drift, makes our approach a promising solution for real-world continual learning applications.
+
+
+\subsection{5.3 Module Contributions (Q2)}
+
+\textbf{Objective.}  
+This section assesses the individual impact of each key module in our system: the adaptive controller, hybrid drift detector, and Elastic Weight Consolidation (EWC) regularization. To quantify the contribution of each component, we conduct an ablation study and analyze the resulting performance changes.
+
+\textbf{Ablation Setup.}  
+We conduct controlled ablation experiments on the Mini-ImageNet dataset, where we incrementally remove core modules from the full system. Each variant is evaluated using the same task stream and metrics as described in Section 5.2. The following variants are considered:
+\begin{itemize}
+    \item \textbf{Ours (Full)}: The complete system with the adaptive controller, hybrid drift detection, and EWC.
+    \item \textbf{w/o Controller}: The system without the adaptive controller, using a fixed learning rate and regularization.
+    \item \textbf{w/o Drift Detection}: The system without the hybrid drift detection module.
+    \item \textbf{w/o EWC}: The system without the EWC regularization, relying on MetaSGD alone for adaptation.
+\end{itemize}
+
+\begin{table}[ht]
+\centering
+\caption{Ablation study on Mini-ImageNet.}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Variant} & \textbf{NTA} & \textbf{OTR} & \textbf{FR} & \textbf{DDA} \\
+\midrule
+Ours (Full)                  & \textbf{74.3} & \textbf{60.8} & \textbf{5.3} & 92.1 \\
+\quad w/o Controller         & 71.1 & 54.7 & 8.1  & 91.9 \\
+\quad w/o Drift Detection    & 70.4 & 52.6 & 9.3  & --   \\
+\quad w/o EWC                & 72.3 & 47.1 & 12.8 & \textbf{92.5} \\
+\bottomrule
+\end{tabular}
+\label{tab:ablation_mini}
+\end{table}
+
+
+\textbf{Analysis.}  
+The results of the ablation study are summarized in Table~\ref{tab:ablation_mini}. We observe that removing the adaptive controller significantly degrades both adaptation and retention. Specifically:
+\textbf{NTA} (New Task Accuracy) drops by 3.2 percentage points.
+\textbf{OTR} (Old Task Retention) drops by 6.1 points.
+\textbf{FR} (Forgetting Rate) increases by over 50\%.
+
+These results clearly demonstrate the importance of the controller in modulating the learning strategy based on the task's drift characteristics. Without the controller, the system lacks the ability to adjust learning rates and regularization based on task complexity or drift, leading to worse adaptation and retention performance.
+
+When the drift detection module is removed, the system fails to switch to MetaSGD when needed, leading to an increase in FR to 9.3. This highlights that the hybrid drift detector plays a crucial role in identifying when drift occurs and ensuring that the system switches to an appropriate adaptation mode (e.g., MetaSGD with EWC) to handle new tasks effectively.
+
+Finally, removing EWC results in the most severe forgetting, with \textbf{FR = 12.8}. This underscores the importance of EWC in preserving important knowledge from previous tasks, preventing catastrophic forgetting during adaptation to new tasks. EWC helps to regularize the model's weights and prevents drastic changes to important parameters that could lead to the loss of previously learned information.
+
+\textbf{Conclusion.}  
+From this ablation study, we conclude that each component of our system contributes significantly to its overall performance:
+ The \textbf{adaptive controller} enables strategy routing and parameter tuning, dynamically adjusting learning rates and regularization based on task characteristics.
+ The \textbf{drift detection module} triggers the appropriate adaptation strategy when drift is detected, ensuring that the system can effectively adapt to new tasks while retaining knowledge of old tasks.
+ \textbf{EWC regularization} mitigates catastrophic forgetting by constraining important parameters and preserving knowledge learned from prior tasks.
+
+Together, these components form a cohesive mechanism that enables stable and efficient continual adaptation in the presence of distributional drift. The results demonstrate that our approach outperforms traditional meta-learning methods by effectively balancing task-specific adaptation and long-term knowledge retention.
+
+
+\subsection{5.4 Controller Behavior and Drift Response (Q3)}
+
+\textbf{Objective.}  
+The objective of this section is to evaluate whether the adaptive controller correctly responds to distributional drift by adjusting the learning parameters (\(\eta_i\) and \(\lambda_i\)) in a task-specific manner. We aim to demonstrate how the controller adjusts its strategies for learning rate and regularization based on drift signals, ensuring that the model adapts effectively to new task distributions while maintaining stability.
+
+\textbf{Trend Analysis.}  
+To better understand the adaptive behavior of the controller, Figure~\ref{fig:controller_dynamics} presents the evolution of task-wise learning rate (\(\eta_i\)) and regularization coefficient (\(\lambda_i\)) over a sequence of 12 tasks. 
+Drift points (Tasks 4, 8, 11) are highlighted as vertical bands, where both controller signals spike in response to abrupt task distribution changes.
+The table beneath reports numerical values for each task to support this observation.
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    scale=1.0,
+    axis/.style={black!70, line width=0.8pt},
+    grid/.style={gray!20, line width=0.3pt},
+    eta/.style={blue!80!black, line width=1.2pt, mark=*, mark size=2pt},
+    lambda/.style={red!80!black, line width=1.2pt, mark=square*, mark size=2pt},
+    drift/.style={orange!20, opacity=0.4},
+    annotation/.style={font=\scriptsize, align=center}
+]
+
+% 坐标轴
+\draw[axis] (0,0) -- (12.5,0) node[right] {Task Sequence};
+\draw[axis] (0,0) -- (0,6) node[above] {Controller Values};
+
+% 网格线
+\foreach \x in {1,...,12} \draw[grid] (\x,0) -- (\x,6);
+\foreach \y in {1,...,5} \draw[grid] (0,\y) -- (12.5,\y);
+
+% η曲线
+\draw[eta] plot[smooth] coordinates {
+    (0.5,1.0) (1.5,1.1) (2.5,1.0) 
+    (3.5,3.2) (4.5,1.3) (5.5,1.2)
+    (6.5,1.1) (7.5,3.5) (8.5,1.2)
+    (9.5,1.0) (10.5,2.9) (11.5,1.1)
+};
+
+% λ曲线
+\draw[lambda] plot[smooth] coordinates {
+    (0.5,0.9) (1.5,1.0) (2.5,0.8) 
+    (3.5,2.6) (4.5,1.1) (5.5,0.9)
+    (6.5,1.0) (7.5,2.7) (8.5,1.0)
+    (9.5,0.9) (10.5,2.3) (11.5,1.0)
+};
+
+% 漂移区域
+\foreach \x in {3.5,7.5,10.5} {
+    \fill[drift] (\x-0.5,0) rectangle (\x+0.5,6);
+    \node[annotation, rotate=90] at (\x,5.6) {Drift};
+}
+
+% 注释
+\node[annotation] at (3.5,4.2) {\textbf{+220\%}};
+\node[annotation, red!70!black] at (7.5,3.8) {\textbf{+250\%}};
+\draw[->, shorten >=2pt] (10.5,2.7) -- (10.5,3.5) 
+    node[above, annotation] {\textbf{response spike}};
+
+% 图例
+\begin{scope}[shift={(11.3,5.3)}]
+    \draw[eta] (0,0) -- (0.6,0) node[right] {$\eta_i$ (learning rate)};
+    \draw[lambda] (0,-0.4) -- (0.6,-0.4) node[right] {$\lambda_i$ (regularization)};
+\end{scope}
+
+% 坐标刻度
+\foreach \y in {0,1,...,5} \node[left] at (0,\y) {\y};
+\foreach \x in {1,...,12} \node[below] at (\x,0) {T\x};
+
+\end{tikzpicture}
+
+\vspace{0.5em}
+\caption{Controller dynamics over 12-task sequence. Highlighted regions indicate drift points, where $\eta_i$ and $\lambda_i$ rise sharply as adaptive responses.}
+\label{fig:controller_dynamics}
+\vspace{1em}
+
+% ====== 表格在图下方 ======
+\begin{tabular}{c|cccccccccccc}
+\toprule
+T & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 10 & 11 & 12 \\
+\midrule
+$\eta_i$ & 1.0 & 1.1 & 1.0 & \textbf{3.2} & 1.3 & 1.2 & 1.1 & \textbf{3.5} & 1.2 & 1.0 & \textbf{2.9} & 1.1 \\
+$\lambda_i$ & 0.9 & 1.0 & 0.8 & \textbf{2.6} & 1.1 & 0.9 & 1.0 & \textbf{2.7} & 1.0 & 0.9 & \textbf{2.3} & 1.0 \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Numerical values of $\eta_i$ and $\lambda_i$ corresponding to the controller dynamics in Figure~\ref{fig:controller_dynamics}. Bold entries coincide with drift-triggered spikes.}
+\label{tab:controller_values}
+\end{figure*}
+
+
+\textbf{Observations.}  
+The controller exhibits distinct peaks in both $\eta_i$ and $\lambda_i$ near major drift points, indicating a shift to a more plastic and regularized adaptation mode. These adjustments occur without any ground truth drift labels and are derived purely from task embeddings and drift detector outputs. For example, at Task 30 (near the first drift point), we observe a significant increase in $\eta_i$ (+215\%) and $\lambda_i$ (+290\%), indicating that the system is responding to the drift by accelerating adaptation while strengthening regularization to prevent forgetting. These changes are temporary and subside after the drift event, with both parameters stabilizing at lower values between drift points. This behavior ensures that the system avoids unnecessary updates and promotes parameter stability when the task distribution is relatively stable.
+
+\textbf{Conclusion.} 
+
+The controller effectively interprets task embeddings and drift signals to regulate the learning process. When drift occurs, the controller increases both the learning rate $\eta_i$ and regularization strength $\lambda_i$, enabling the model to adapt quickly to new task distributions. Between drift events, both parameters stabilize, ensuring that the model does not overfit to recent tasks and retains its ability to generalize across tasks. The dynamic adjustment of learning parameters, as shown in Figure~\ref{fig:controller_dynamics}, confirms that the controller is responding correctly to drift and balancing fast learning with long-term retention in a closed-loop system. This behavior validates our approach and demonstrates its effectiveness in continual learning under dynamic conditions.
+
+
+
+\subsection{5.5 Cross-Dataset Generalization (Q4)}
+
+\textbf{Objective.}  
+In this section, we evaluate whether our framework generalizes effectively across domains with different modalities, class structures, and distributional characteristics. The ability to generalize across diverse datasets is critical for deploying continual learning systems in real-world applications where tasks often come from different domains with varying distributions.
+
+\textbf{Datasets.}  
+We test our method on three benchmark datasets, each representing different domains and task characteristics:
+\begin{itemize}
+    \item \textbf{Mini-ImageNet~\cite{vinyals2016matching}}: A standard benchmark consisting of natural object categories. It provides a rich set of classes with complex visual variations, making it challenging for few-shot learning.
+    \item \textbf{Omniglot~\cite{lake2015human}}: A dataset consisting of character-based tasks with high inter-class separability. This dataset challenges the model with highly diverse handwritten characters, making it ideal for evaluating generalization across different classes with subtle feature differences.
+    \item \textbf{Meta-Dataset~\cite{triantafillou2019meta}}: A heterogeneous benchmark that combines multiple datasets (e.g., CUB, Aircraft, Fungi), introducing domain shifts and label imbalance. This dataset provides a test of robustness in environments where tasks come from different sources with varying characteristics.
+\end{itemize}
+
+These datasets provide a diverse set of challenges, from object recognition to character classification and multi-domain few-shot learning, ensuring that our method is rigorously tested in different contexts.
+
+\textbf{Main Results.}  
+Table~\ref{tab:cross_main} shows the New Task Accuracy (NTA) results across the three datasets. Our method consistently outperforms all baselines, demonstrating strong generalization capabilities across domains.
+
+\begin{table}[ht]
+\centering
+\caption{New Task Accuracy (NTA) across datasets.}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & Mini-ImageNet & Omniglot & Meta-Dataset \\
+\midrule
+ProtoNet         & 65.2 & 70.1 & 58.3 \\
+ProtoNet + EWC   & 66.8 & 74.3 & 61.5 \\
+MetaSGD          & 71.5 & 78.2 & 65.7 \\
+\textbf{Ours (Full)}      & \textbf{74.3} & \textbf{82.6} & \textbf{68.4} \\
+\bottomrule
+\end{tabular}
+\label{tab:cross_main}
+\end{table}
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[
+    scale=0.85,
+    axis/.style={ultra thick, gray!40},
+    grid/.style={dashed, gray!20, line width=0.5pt},
+    dataset/.style={
+        mark=*,
+        mark size=2pt,
+        line width=1.5pt,
+        opacity=0.9
+    },
+    legend/.style={
+        cells={anchor=west},
+        font=\footnotesize,
+        column sep=5pt,
+        row sep=2pt
+    }
+]
+
+% ===== 坐标轴系统（3个方向）=====
+\foreach \angle in {0,120,240} {
+    \draw[axis] (0,0) -- (\angle:5cm); % 主轴
+    \foreach \r in {1,...,5} {
+        \draw[grid] (\angle:\r) -- (\angle+120:\r); % 网格线
+    }
+}
+
+% ===== 网格环（5圈，代表0–10刻度）=====
+\foreach \r in {1,...,5} {
+    \draw[grid] (0,0) circle (\r cm); % 同心圆
+    \node[anchor=north, font=\tiny] at (0,\r) {\pgfmathparse{\r*2}\pgfmathresult}; % 刻度标签
+}
+
+% ===== 数据集性能曲线（NTA ÷ 20）=====
+\draw[dataset, blue] 
+    plot coordinates {(0:3.72) (120:4.13) (240:3.42)} 
+    -- cycle;
+
+\draw[dataset, red] 
+    plot coordinates {(0:3.26) (120:3.51) (240:2.92)} 
+    -- cycle;
+
+% ===== 轴标签 =====
+\foreach \angle/\label in {
+    0/MiniImageNet,
+    120/Omniglot,
+    240/Meta-Dataset
+}{
+    \node[anchor=\angle+180, font=\small] at (\angle:5.5cm) {\label};
+}
+
+% ===== 图例 =====
+\begin{scope}[shift={(5.8cm,-2.5cm)}]  % 手动偏移图例
+    \node[draw, fill=white, rounded corners, inner sep=4pt] (legendbox) {
+        \begin{tabular}{@{}ll@{}}
+        \tikz\draw[blue, line width=1.5pt] (0,0)--(0.5,0); & \textbf{Ours (Full)} \\
+        \tikz\draw[red, line width=1.5pt] (0,0)--(0.5,0); & \textbf{ProtoNet} \\
+        \end{tabular}
+    };
+\end{scope}
+
+% ===== 标题标注 =====
+\node[above, font=\small\bfseries, yshift=1cm] 
+    at (current bounding box.north) 
+    {Cross-Dataset NTA Performance (5-way 1-shot)};
+
+\end{tikzpicture}
+\caption{Radar plot comparing new task accuracy (NTA) across MiniImageNet, Omniglot, and Meta-Dataset. Our model demonstrates higher robustness and generalization under drifted tasks.}
+\label{fig:enhanced_radar}
+\end{figure*}
+
+
+
+\textbf{Analysis.}  
+On \textbf{Omniglo}, our method shows the largest gain (+12.5\% over ProtoNet), benefiting from the controller's ability to modulate learning rates based on clear embedding separation. The high intra-class separability in Omniglot allows our method to adjust learning rates more effectively, improving performance across the alphabet-based tasks.
+
+On \textbf{Meta-Dataset}, although the absolute gains are smaller compared to Omniglot, our system still outperforms all baselines, showing robustness to domain heterogeneity and label imbalance. The variation in tasks within Meta-Dataset (e.g., CUB, Aircraft, Fungi) introduces significant challenge due to domain shifts and class imbalance, yet our method maintains superior performance across these diverse domains. This demonstrates the generalizability of our approach in real-world settings where tasks may come from different sources with varying distributions.
+
+\textbf{Ablation Across Datasets}, 
+We further validate module effectiveness by conducting ablation studies on both **Omniglot** (Table~\ref{tab:ablation_omniglot}) and **Meta-Dataset** (Table~\ref{tab:ablation_meta}).
+
+\vspace{0.5em}
+\noindent\textbf{Omniglot Ablation Results}
+
+\begin{table}[ht]
+\centering
+\caption{Module ablation on Omniglot.}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & NTA & OTR & FR \\
+\midrule
+Ours (Full)         & \textbf{82.6} & \textbf{66.1} & 3.2 \\
+\quad w/o Controller& 78.3 & 59.4 & 5.9 \\
+\quad w/o Drift Det.& 77.0 & 57.3 & \textbf{6.4} \\
+\quad w/o EWC       & 79.4 & 58.8 & 4.5 \\
+\bottomrule
+\end{tabular}
+\label{tab:ablation_omniglot}
+\end{table}
+
+
+\vspace{0.5em}
+\noindent\textbf{Meta-Dataset Ablation Results}
+
+\begin{table}[ht]
+\centering
+\caption{Module ablation on Meta-Dataset.}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & NTA & OTR & FR \\
+\midrule
+Ours (Full)         & \textbf{68.4} & \textbf{52.5} & 7.9 \\
+\quad w/o Controller& 64.2 & 48.1 & 11.2 \\
+\quad w/o Drift Det.& 62.9 & 45.7 & 12.3 \\
+\quad w/o EWC       & 66.0 & 44.0 & \textbf{13.5} \\
+\bottomrule
+\end{tabular}
+\label{tab:ablation_meta}
+\end{table}
+
+
+\textbf{Conclusion.}  
+Across all datasets, our method generalizes well to new task distributions, adapting effectively even in environments with domain shifts and class imbalances. The controller-based adaptation and drift-aware regularization allow our method to remain robust and efficient, even in complex, heterogeneous task regimes. These results confirm that our approach is highly versatile and capable of handling a variety of tasks from different domains.
+
+
+\subsection{5.6 Case Study: Detector Success and Failure}
+
+\textbf{Objective.}  
+This section provides qualitative insights into the internal decision-making of our system and diagnoses failure cases in drift detection and controller routing. By examining specific cases, we aim to understand the strengths and weaknesses of our drift detection module and the adaptive controller in handling distributional shifts.
+
+\textbf{Case Study Setup.}  
+We focus on two tasks—Task 42 and Task 67—to illustrate how the system responds to drift. Table~\ref{tab:case_drift} summarizes the controller’s response to these tasks, including the ground truth (GT) drift status, the system’s predicted drift status, and the corresponding action taken by the system.
+
+\begin{table}[ht]
+\centering
+\caption{Selected case study: controller response to drift.}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Task ID} & \textbf{Drift (GT)} & \textbf{Predicted} & \textbf{Action} \\
+\midrule
+Task 42 & Yes  & Yes  & MetaSGD + EWC \\
+Task 67 & Yes  & No   & ProtoNet only \\
+\bottomrule
+\end{tabular}
+\label{tab:case_drift}
+\end{table}
+
+\textbf{Task 42.}  
+This task introduces new classes with embeddings that are distant from previous task embeddings, indicating a significant shift in the task distribution. The hybrid drift detector correctly flags this task as having drift by detecting a large KL divergence between the current task and prior tasks. As a result, the controller adjusts the learning rate ($\eta_i$) and regularization strength ($\lambda_i$), invoking the MetaSGD + EWC path for fine-tuning. This leads to rapid adaptation, and the model achieves high accuracy on the task, as the adaptive learning rate allows it to focus on the novel task features while preventing forgetting of previous knowledge.
+
+\textbf{Task 67.}  
+Although Task 67 exhibits ground truth drift (i.e., a shift in class distribution), the feature distribution overlaps significantly with past classes, resulting in a relatively small KL divergence. Consequently, the drift detector fails to flag this as a drifted task because the KL divergence remains below the threshold, and the classifier’s confidence in detecting drift is low. As a result, the controller selects the ProtoNet path for inference instead of MetaSGD + EWC. This leads to under-adaptation, as ProtoNet relies on a fixed set of prototypes and cannot adequately adapt to the new classes introduced by the drift. The performance on Task 67 is thus degraded compared to the correct response.
+
+This case highlights a \textit{false negative} in drift detection, where a subtle shift in task distribution evades detection, leading to suboptimal adaptation. The failure occurs because the drift signal did not exceed the predefined threshold, even though the task had actually drifted, indicating that our current thresholding approach might not always be sensitive enough to detect small or gradual shifts.
+
+\textbf{Conclusion.}  
+While the system handles most drifted tasks correctly, this case study illustrates that borderline tasks with subtle or gradual shifts may evade detection and lead to under-adaptation. These false negatives can occur when the drift signal is not strong enough to surpass the threshold, despite the presence of drift. To address this limitation, future work could explore several improvements:
+ \textbf{Uncertainty-aware thresholding}: Incorporating uncertainty estimates into the drift detection process could help handle subtle shifts more effectively by adjusting the threshold dynamically based on the task's complexity.
+ \textbf{Joint embedding drift modeling}: Instead of relying on a single drift measure, a multi-faceted approach that models drift across both task embeddings and prototype spaces could provide more robust drift detection.
+ \textbf{Task replay for borderline cases}: Introducing a task replay mechanism, where borderline drift tasks are re-evaluated with additional context or replayed memory, could improve the detection and adaptation of these tricky cases.
+
+By addressing these issues, we can further improve the accuracy and robustness of drift detection and adaptation in future versions of the system.
+
+
+\subsection{5.7 Summary of Results}
+
+Across a range of metrics, datasets, and evaluation protocols, our proposed framework demonstrates strong adaptability, stability, and generalization in continual few-shot learning:
+
+\begin{itemize}
+    \item \textbf{Fast adaptation:}  
+    Our method achieves a +9.1\% gain in New Task Accuracy (NTA) over ProtoNet and a +2.8\% gain over MetaSGD on the Mini-ImageNet dataset. These results confirm that our approach enables rapid adaptation to new tasks, significantly outperforming baseline methods, especially in environments with evolving task distributions.
+    
+    \item \textbf{Memory retention:}  
+    The combination of Elastic Weight Consolidation (EWC) regularization and the replay buffer contributes to the lowest forgetting rate (FR = 5.3). Our method achieves the highest Old Task Retention (OTR) across tasks, demonstrating effective preservation of knowledge over time. This is particularly important in continual learning, where the ability to retain performance on past tasks while learning new ones is critical.
+    
+    \item \textbf{Drift awareness:}  
+    The hybrid drift detector achieves 92.5\% detection accuracy, enabling effective policy routing. By detecting when distributional drift occurs, the system adjusts its learning strategy to handle novel tasks more effectively, ensuring the model adapts appropriately and avoids catastrophic forgetting.
+    
+    \item \textbf{Controller effectiveness:}  
+    The controller dynamically adjusts learning parameters in response to detected drift, with parameter spikes aligning to known drift points. This dynamic adjustment of learning rates ($\eta_i$) and regularization strength ($\lambda_i$) ensures efficient adaptation while preserving stability during periods of non-drift. The system's ability to respond quickly and effectively to drift highlights the importance of the adaptive controller in our framework.
+    
+    \item \textbf{Cross-domain generalization:}  
+    Our method maintains top accuracy across different datasets, including Omniglot (+12.5\% NTA vs. ProtoNet) and Meta-Dataset (+7.1\% NTA). This shows that the system generalizes well across domains with varying characteristics, such as handwriting in Omniglot and heterogeneous task types in Meta-Dataset. The strong performance across these diverse datasets demonstrates the versatility and robustness of our approach in handling tasks from different domains.
+    
+    \item \textbf{Low overhead:}  
+    Despite the inclusion of adaptive modules such as drift detection and task-specific optimization, the average adaptation time remains under 0.25 seconds per task. This low computational overhead makes our method suitable for real-time applications, where quick adaptation is essential without sacrificing performance.
+\end{itemize}
+
+These results collectively validate the core hypothesis of this work: that a closed-loop system combining task embedding, drift detection, adaptive control, and conditional optimization can deliver robust continual few-shot learning under realistic distributional shifts. The performance improvements across multiple datasets and metrics demonstrate that our approach is capable of maintaining high accuracy, minimizing forgetting, and adapting effectively to new tasks in dynamic environments.
+
+Moreover, the ablation studies confirm that each module—task embedding, drift detection, adaptive controller, and EWC regularization—plays a crucial role in achieving the strong overall performance. The controller's ability to adjust parameters based on drift and task complexity, along with the use of EWC for retaining prior knowledge, are key factors that differentiate our method from existing approaches.
+
+\section{Conclusion}
+
+In this work, we have presented a closed-loop, adaptive meta-learning framework designed to address the challenges of continual few-shot classification in dynamic, non-stationary environments. By integrating Transformer-based task embeddings, hybrid drift detection, a task-conditioned controller, and conditional optimization via MetaSGD and EWC, our system dynamically adapts its learning strategy based on evolving task characteristics. This design enables both rapid adaptation to new tasks and effective retention of knowledge from previous tasks—two critical traits for real-world deployment in environments with changing data distributions.
+
+Through extensive experiments on three benchmark datasets—Mini-ImageNet, Omniglot, and Meta-Dataset—our method consistently outperforms strong baselines such as ProtoNet, MAML, MetaSGD, and iCaRL. We achieve the highest accuracy on both new and old tasks (NTA/OTR), the lowest forgetting rate (FR = 5.3), and near-perfect drift detection accuracy (DDA = 92.5\%). Furthermore, despite the added complexity of adaptive modules, our method maintains low computational overhead, with an average adaptation time of less than 0.25 seconds per task. Ablation studies confirm that each component—drift detection, controller routing, and EWC regularization—plays a meaningful role in improving performance.
+
+In-depth analysis of the controller’s behavior demonstrates its ability to dynamically adjust the learning rate and regularization parameters in response to detected distributional shifts. This dynamic modulation allows for aggressive adaptation during drift events and stabilization during periods of task consistency, forming the backbone of our closed-loop design. This feedback loop ensures that the system can continuously adapt at the task level, not only by updating model weights but also by adjusting the underlying meta-learning policy.
+
+Our method also shows strong generalization across heterogeneous domains, including character recognition (Omniglot), fine-grained classification (CUB), and multi-source benchmarks (Meta-Dataset). Case studies reveal that the controller effectively responds to drift signals, although edge cases involving subtle semantic shifts pose challenges for the current drift detection mechanism. These qualitative insights complement the strong quantitative results and suggest areas for further refinement.
+
+\vspace{0.5em}
+\noindent\textbf{Key Takeaways.}
+\begin{itemize}
+\item A task-conditioned controller can successfully route adaptation policies based on drift detected in task embeddings.
+\item Drift-aware modulation of learning rates and regularization improves both adaptation speed (plasticity) and long-term knowledge retention (stability).
+\item Conditional optimization, triggered by online drift detection, significantly mitigates catastrophic forgetting by selectively applying regularization when necessary.
+\item Our framework ensures fast, stable learning with minimal computational overhead, even in dynamic and heterogeneous task environments.
+\item The system generalizes well across domains and demonstrates robustness to domain shifts, class variability, and task ambiguity.
+\end{itemize}
+
+\vspace{0.5em}
+\noindent\textbf{Limitations and Future Work.}  
+While our framework demonstrates strong adaptability and robustness under continual few-shot scenarios, several limitations remain that open up avenues for future research.
+
+First, although our hybrid drift detector combines statistical and discriminative signals, it remains sensitive to subtle or gradual shifts that occur over long time scales. These weak signals may be insufficient to trigger adaptation, especially when the drift manifests as minor semantic changes or smooth feature transitions. Future work will explore confidence-calibrated drift thresholds, temporal drift smoothing techniques, and uncertainty-aware mechanisms that adaptively adjust sensitivity to nuanced distributional changes.
+
+Second, the current replay buffer operates with a fixed size and random sampling strategy, which may underrepresent rare or long-tail tasks. This limits the system’s ability to retain nuanced knowledge from low-frequency tasks. To address this, we plan to incorporate adaptive memory strategies that prioritize task diversity or forgetting risk, possibly by using task importance scores derived from stability-plasticity tradeoffs or Fisher information.
+
+Third, while the controller demonstrates reliable drift responsiveness, its decisions are currently opaque and hand-tuned in structure. Improving its interpretability and adaptability remains a crucial direction. Future work will investigate incorporating attention-based mechanisms or meta-learned reinforcement learning objectives to allow the controller to evolve its decision-making strategy over time and discover more nuanced adaptation policies.
+
+Finally, while our method performs well across a range of datasets, its integration with large-scale pretrained or foundation models remains unexplored. By embedding our adaptive mechanism within such models, we hope to leverage their transferable representations to further improve generalization and robustness in open-world, multi-domain environments.
+
+Overall, these directions point toward a more flexible, interpretable, and scalable continual learning system, capable of not only adapting to evolving task streams but also reasoning about when and how to adapt in a self-directed manner.
+
+\bibliographystyle{IEEEtran} 
+\bibliography{references}
+
+
+
+
+\end{document}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

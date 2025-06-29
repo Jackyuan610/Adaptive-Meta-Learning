@@ -1,0 +1,16 @@
+name: cs731
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.9
+  - numpy=1.23.5
+  - matplotlib
+  - scikit-learn
+  - pandas
+  - tqdm
+  - pytorch=1.13.1
+  - torchvision=0.14.1
+  - pip
+  - pip:
+      - torch
