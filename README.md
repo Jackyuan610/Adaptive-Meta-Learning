@@ -141,7 +141,6 @@ After training, the following files are generated:
   title={Adaptive Few-Shot Meta-Learning with Drift Detection and Task-Aware Optimization},
   author={Yiming Yuan},
   year={2025},
-  note={University of Auckland},
 }
 ```
 
