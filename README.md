@@ -3,7 +3,7 @@
 This repository contains the official implementation of our paper:
 
 > **"Adaptive Few-Shot Meta-Learning with Drift Detection and Task-Aware Optimization"**  
-> Yiming Yuan, University of Auckland
+> Yiming Yuan
 
 ## 🎯 Overview
 
